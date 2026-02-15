@@ -323,6 +323,102 @@ js__module_script_evaluate(void *objc_context, void *script) {
   return result.JSValueRef;
 }
 
+// -----------------------------------------------------------------------
+// Batch module registration via provideFetch
+// -----------------------------------------------------------------------
+// Each [JSContext evaluateJSScript:] call internally invokes
+// JSC::loadAndEvaluateModule which synchronously calls provideFetch —
+// registering the module source in JSC's internal fetch map. However,
+// evaluateJSScript also creates a JSLockHolder whose destructor calls
+// willReleaseLock() → drainMicrotasks(). This means after EACH call,
+// microtasks run and imports are resolved — triggering the delegate.
+//
+// By holding an OUTER JSLockHolder (obtained via dlsym), the inner lock
+// in evaluateJSScript never drops to zero, so willReleaseLock/drainMicrotasks
+// is suppressed. All provideFetch registrations happen synchronously.
+// When we release the outer lock, drainMicrotasks runs once and ALL imports
+// resolve from the pre-registered fetch map — zero delegate calls.
+
+#include <dlfcn.h>
+
+typedef void (*js__lock_ctor_fn)(void *self, void *globalObject);
+typedef void (*js__lock_dtor_fn)(void *self);
+
+static js__lock_ctor_fn s_lock_ctor = NULL;
+static js__lock_dtor_fn s_lock_dtor = NULL;
+static bool s_lock_resolved = false;
+
+static void
+js__resolve_lock_symbols(void) {
+  if (s_lock_resolved) return;
+  s_lock_resolved = true;
+
+  // JSC::JSLockHolder::JSLockHolder(JSC::JSGlobalObject*)
+  s_lock_ctor = (js__lock_ctor_fn)dlsym(RTLD_DEFAULT,
+    "__ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE");
+
+  // JSC::JSLockHolder::~JSLockHolder()
+  s_lock_dtor = (js__lock_dtor_fn)dlsym(RTLD_DEFAULT,
+    "__ZN3JSC12JSLockHolderD1Ev");
+
+  if (s_lock_ctor && s_lock_dtor) {
+    NSLog(@"[libjsc] provideFetch: JSLockHolder resolved via dlsym");
+  } else {
+    NSLog(@"[libjsc] provideFetch: JSLockHolder NOT found (ctor=%p dtor=%p)",
+          s_lock_ctor, s_lock_dtor);
+  }
+}
+
+void
+js__batch_register_modules(void *objc_context, void **scripts, size_t count) {
+  if (count == 0) return;
+
+  js__resolve_lock_symbols();
+
+  JSContext *ctx = (__bridge JSContext *)objc_context;
+
+  if (s_lock_ctor && s_lock_dtor) {
+    JSGlobalContextRef ctx_ref = ctx.JSGlobalContextRef;
+
+    // JSLockHolder layout: { RefPtr<JSLock> m_lock; } = 8 bytes
+    // Use 16 bytes for safety/alignment.
+    char lock_buf[16];
+    memset(lock_buf, 0, sizeof(lock_buf));
+
+    // Acquire outer lock — prevents willReleaseLock()/drainMicrotasks()
+    // from firing inside evaluateJSScript's nested JSLockHolder.
+    // JSGlobalContextRef == JSGlobalObject* (direct reinterpret_cast in JSC).
+    s_lock_ctor(lock_buf, (void *)ctx_ref);
+
+    NSLog(@"[libjsc] provideFetch: registering %zu modules within lock",
+          (unsigned long)count);
+
+    for (size_t i = 0; i < count; i++) {
+      JSScript *s = (__bridge JSScript *)scripts[i];
+      // evaluateJSScript → loadAndEvaluateModule → provideFetch (synchronous)
+      // The returned promise is not drained yet (outer lock held).
+      [ctx evaluateJSScript:s];
+    }
+
+    NSLog(@"[libjsc] provideFetch: releasing lock — draining microtasks");
+
+    // Release outer lock → lock count drops to 0 → willReleaseLock() →
+    // drainMicrotasks(). All imports resolve from the provideFetch map.
+    s_lock_dtor(lock_buf);
+
+    NSLog(@"[libjsc] provideFetch: batch registration complete");
+  } else {
+    // Fallback: sequential evaluation without lock holding.
+    // The delegate WILL be called for each import (may stack overflow).
+    NSLog(@"[libjsc] provideFetch: FALLBACK — sequential eval for %zu modules",
+          (unsigned long)count);
+    for (size_t i = 0; i < count; i++) {
+      JSScript *s = (__bridge JSScript *)scripts[i];
+      [ctx evaluateJSScript:s];
+    }
+  }
+}
+
 void
 js__objc_set_global_property(void *objc_context, const char *key, JSValueRef value) {
   JSContext *ctx = (__bridge JSContext *)objc_context;

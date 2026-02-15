@@ -1722,82 +1722,40 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   // the delegate handles setting globalThis.__jsc_syn before JSC
   // evaluates the synthetic source.
 
-  // --- Topological pre-evaluation ---
-  // Evaluate all dependency modules in bottom-up order (leaves first) before
-  // evaluating the root module. This populates JSC's internal module cache
-  // so that when the root module is evaluated, all its imports are found in
-  // the cache and the delegate is NOT called — eliminating the deep recursion
-  // that causes RangeError: Maximum call stack size exceeded on iOS.
+  // --- provideFetch batch registration ---
+  // Register ALL dependency module sources in JSC's internal fetch map
+  // before any import resolution runs. Uses dlsym'd JSLockHolder to hold
+  // the JSC lock across all evaluateJSScript: calls, preventing microtask
+  // drain between them. When the lock is released, drainMicrotasks runs
+  // once and all imports resolve from the pre-registered map — the delegate
+  // is never called. No stack overflow, no per-module drain overhead.
   if (env->module_eval_count > 0) {
     char logbuf[128];
     snprintf(logbuf, sizeof(logbuf),
-      "js_run_module: pre-evaluating %zu dependency modules", env->module_eval_count);
+      "js_run_module: batch-registering %zu deps via provideFetch",
+      env->module_eval_count);
     js__nslog(logbuf);
+
+    // Collect dependency scripts (exclude root — evaluated separately below)
+    void **dep_scripts = malloc(env->module_eval_count * sizeof(void *));
+    size_t dep_count = 0;
 
     for (size_t i = 0; i < env->module_eval_count; i++) {
       js_module_t *dep = env->module_eval_order[i];
-      if (dep == module) continue;  // Skip the root — evaluated below
+      if (dep == module) continue;
       if (dep->jsc_script == NULL) continue;
-
-      JSValueRef dep_result = js__module_script_evaluate(
-        env->objc_context, dep->jsc_script);
-
-      if (dep_result != NULL && JSValueIsObject(env->context, dep_result)) {
-        // Check if this returned a promise (module has dependencies still resolving)
-        JSStringRef then_key = JSStringCreateWithUTF8CString("then");
-        JSValueRef then_val = JSObjectGetProperty(env->context,
-          (JSObjectRef)dep_result, then_key, NULL);
-        JSStringRelease(then_key);
-
-        if (!JSValueIsUndefined(env->context, then_val)) {
-          // Dependency returned a promise — drain until it resolves.
-          // This shouldn't happen for leaf modules (no imports).
-          snprintf(logbuf, sizeof(logbuf),
-            "js_run_module: dep[%zu] '%s' returned promise, draining",
-            i, dep->name ? dep->name : "?");
-          js__nslog(logbuf);
-
-          // Set up promise tracking
-          JSObjectRef global = JSContextGetGlobalObject(env->context);
-          JSStringRef dp_key = JSStringCreateWithUTF8CString("__jsc_dp");
-          JSObjectSetProperty(env->context, global, dp_key, dep_result, 0, NULL);
-          JSStringRelease(dp_key);
-
-          JSStringRef track_code = JSStringCreateWithUTF8CString(
-            "globalThis.__jsc_ds = 0;"
-            "__jsc_dp.then("
-            "  function() { globalThis.__jsc_ds = 1; },"
-            "  function() { globalThis.__jsc_ds = 2; }"
-            ")");
-          JSEvaluateScript(env->context, track_code, NULL, NULL, 0, NULL);
-          JSStringRelease(track_code);
-
-          int dep_state = 0;
-          for (int iter = 0; iter < 1000 && dep_state == 0; iter++) {
-            js__module_delegate_drain_one(env->module_loader_delegate);
-            js__drain_run_loop();
-            dep_state = js__objc_eval_int(env->objc_context, "globalThis.__jsc_ds");
-          }
-
-          // Clean up tracking globals
-          JSStringRef del_dp = JSStringCreateWithUTF8CString("__jsc_dp");
-          JSObjectDeleteProperty(env->context, global, del_dp, NULL);
-          JSStringRelease(del_dp);
-          JSStringRef del_ds = JSStringCreateWithUTF8CString("__jsc_ds");
-          JSObjectDeleteProperty(env->context, global, del_ds, NULL);
-          JSStringRelease(del_ds);
-
-          snprintf(logbuf, sizeof(logbuf),
-            "js_run_module: dep[%zu] drain finished, state=%d", i, dep_state);
-          js__nslog(logbuf);
-        }
-      }
+      dep_scripts[dep_count++] = dep->jsc_script;
     }
 
-    // Clear the eval order — consumed
+    // Batch-evaluate all deps within a single JSLockHolder scope.
+    // Each evaluateJSScript call registers the module source via provideFetch.
+    // The outer lock prevents microtask drain until ALL sources are registered.
+    js__batch_register_modules(env->objc_context, dep_scripts, dep_count);
+
+    free(dep_scripts);
     env->module_eval_count = 0;
 
-    js__nslog("js_run_module: pre-evaluation complete, evaluating root module");
+    js__nslog("js_run_module: batch registration complete, evaluating root");
   }
 
   env->depth++;
