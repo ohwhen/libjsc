@@ -61,6 +61,13 @@ js__objc_get_context_ref(void *objc_context);
 void
 js__nslog(const char *msg);
 
+// Pop and resolve one queued module resolution from the delegate.
+// Returns 1 if a resolution was processed, 0 if the queue was empty.
+// Resets the batch counter so the resolve can trigger up to
+// kMaxResolveBatch synchronous resolutions before queuing again.
+int
+js__module_delegate_drain_one(void *delegate);
+
 // Process pending run loop sources. JSC's module loader dispatches
 // dependency resolution via the run loop, not the microtask queue.
 // Returns 1 if a source was handled, 0 otherwise.

@@ -1754,12 +1754,15 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
     JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
     JSStringRelease(chain_code);
 
-    // Drain microtasks via Obj-C evaluateScript: API, which may have
-    // different microtask processing than the C API JSEvaluateScript.
-    // The C API doesn't drain microtasks when called from within a
-    // native function invoked by JavaScript (reentrancy guard).
+    // Drain module resolutions and microtasks. The delegate queues
+    // module resolutions beyond kMaxResolveBatch to prevent stack
+    // overflow. Each drain_one pops one item, resets the batch counter,
+    // and resolves it — which may trigger up to kMaxResolveBatch more
+    // synchronous resolutions before queuing again. drain_run_loop
+    // processes any pending run loop sources JSC needs.
     int iterations = 0;
-    for (; iterations < 500 && state == 0; iterations++) {
+    for (; iterations < 5000 && state == 0; iterations++) {
+      js__module_delegate_drain_one(env->module_loader_delegate);
       js__drain_run_loop();
       state = js__objc_eval_int(env->objc_context, "globalThis.__jsc_ms");
     }

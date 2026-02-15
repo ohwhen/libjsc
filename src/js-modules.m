@@ -46,15 +46,18 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   @public
   js_env_t *env;
   NSMutableDictionary<NSString *, NSValue *> *moduleRegistry;
+  NSMutableArray *pendingResolutions;  // Queue of deferred resolve blocks
   int resolveCount;    // Total synchronous resolves in current batch
-  int resolveDepth;    // Current nesting depth for recursion tracking
 }
 @end
 
-// After this many synchronous resolves, defer the next batch to the run loop.
-// JSC's JS stack (~10K frames) overflows around 200+ module evaluations.
-// This breaks the chain into manageable chunks.
-static const int kMaxResolveBatch = 20;
+// After this many synchronous resolves, defer to the pending queue.
+// JSC's module evaluation is recursive: each resolve triggers parsing and
+// evaluation of that module, which calls the delegate for sub-imports.
+// Each level adds ~10 JS frames. At ~100 levels the JS stack overflows.
+// The drain loop in js_run_module pops one item from the queue per iteration,
+// resets the counter, and resolves it — starting a new batch.
+static const int kMaxResolveBatch = 50;
 
 @implementation JSCModuleDelegate
 
@@ -62,8 +65,8 @@ static const int kMaxResolveBatch = 20;
   self = [super init];
   if (self) {
     moduleRegistry = [[NSMutableDictionary alloc] init];
+    pendingResolutions = [[NSMutableArray alloc] init];
     resolveCount = 0;
-    resolveDepth = 0;
   }
   return self;
 }
@@ -143,24 +146,21 @@ static const int kMaxResolveBatch = 20;
   }
 
   // Batch-limited resolution: resolve synchronously up to kMaxResolveBatch
-  // modules, then defer remaining resolutions to the next run loop iteration.
-  // JSC evaluates resolved modules via microtask chaining; 200+ modules in
-  // a single batch overflows the JS stack (RangeError: Maximum call stack
-  // size exceeded). Breaking into batches of 20 keeps the stack manageable.
-  // When deferred blocks fire, resolveCount resets, allowing the next batch.
+  // modules, then queue remaining resolutions for the drain loop in js.c.
+  // JSC evaluates resolved modules recursively; 200+ modules in a single
+  // chain overflows the JS stack (RangeError: Maximum call stack size
+  // exceeded). The drain loop pops one item per iteration, resets the
+  // counter, and resolves it — starting a new batch of up to kMaxResolveBatch.
   JSScript *s = (__bridge JSScript *)script;
 
   if (resolveCount < kMaxResolveBatch) {
     resolveCount++;
     [resolve callWithArguments:@[s]];
   } else {
-    // Defer to next run loop iteration; reset counter for the new batch
-    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopDefaultMode, ^{
-      self->resolveCount = 0;
+    // Queue for later processing by js__module_delegate_drain_one
+    [pendingResolutions addObject:[^{
       [resolve callWithArguments:@[s]];
-      self->resolveCount++;
-    });
-    CFRunLoopWakeUp(CFRunLoopGetMain());
+    } copy]];
   }
 }
 
@@ -256,6 +256,24 @@ js__module_delegate_lookup(void *delegate, const char *url) {
   NSValue *entry = d->moduleRegistry[key];
   if (entry == nil) return NULL;
   return (js_module_t *)[entry pointerValue];
+}
+
+int
+js__module_delegate_drain_one(void *delegate) {
+  if (delegate == NULL) return 0;
+  JSCModuleDelegate *d = (__bridge JSCModuleDelegate *)delegate;
+  if (d->pendingResolutions.count == 0) return 0;
+
+  // Pop the first queued resolution and execute it.
+  // Reset the batch counter so the new resolve call can trigger
+  // up to kMaxResolveBatch synchronous resolutions before queuing again.
+  d->resolveCount = 0;
+
+  void (^block)(void) = d->pendingResolutions[0];
+  [d->pendingResolutions removeObjectAtIndex:0];
+  block();
+
+  return 1;
 }
 
 void *
