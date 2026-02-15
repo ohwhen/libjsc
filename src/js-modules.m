@@ -47,18 +47,9 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   js_env_t *env;
   NSMutableDictionary<NSString *, NSValue *> *moduleRegistry;
   NSMutableArray *pendingResolutions;  // Queue of deferred resolve blocks
-  int resolveCount;    // Total synchronous resolves in current batch
   BOOL isDraining;     // Prevents nested drain loops
 }
 @end
-
-// After this many synchronous resolves, defer to the pending queue.
-// JSC's module evaluation is recursive: each resolve triggers parsing and
-// evaluation of that module, which calls the delegate for sub-imports.
-// Each level adds ~10 JS frames. At ~100 levels the JS stack overflows.
-// The drain loop in js_run_module pops one item from the queue per iteration,
-// resets the counter, and resolves it — starting a new batch.
-static const int kMaxResolveBatch = 10;
 
 @implementation JSCModuleDelegate
 
@@ -67,7 +58,6 @@ static const int kMaxResolveBatch = 10;
   if (self) {
     moduleRegistry = [[NSMutableDictionary alloc] init];
     pendingResolutions = [[NSMutableArray alloc] init];
-    resolveCount = 0;
   }
   return self;
 }
@@ -146,39 +136,31 @@ static const int kMaxResolveBatch = 10;
     }
   }
 
-  // Batch-limited resolution: resolve synchronously up to kMaxResolveBatch
-  // modules, then queue remaining resolutions for the drain loop in js.c.
-  // JSC evaluates resolved modules recursively; 200+ modules in a single
-  // chain overflows the JS stack (RangeError: Maximum call stack size
-  // exceeded). The drain loop pops one item per iteration, resets the
-  // counter, and resolves it — starting a new batch of up to kMaxResolveBatch.
+  // Always queue resolutions — never resolve synchronously within the
+  // delegate. JSC evaluates resolved modules recursively: each synchronous
+  // resolve triggers parsing + evaluation, which calls the delegate for
+  // sub-imports. Even 10 nested levels overflows the JS stack on iOS.
+  //
+  // Instead, queue every resolution. The outermost delegate call enters a
+  // while loop that pops and resolves one module at a time. Each resolve
+  // triggers JSC evaluation, which calls the delegate for sub-imports —
+  // those just queue (isDraining prevents re-entering the loop). The while
+  // loop then picks them up iteratively. Stack depth: exactly 1 level of
+  // delegate → resolve → JSC eval → delegate(queue) at all times.
   JSScript *s = (__bridge JSScript *)script;
 
-  if (resolveCount < kMaxResolveBatch) {
-    resolveCount++;
+  [pendingResolutions addObject:[^{
     [resolve callWithArguments:@[s]];
-  } else {
-    // Queue for deferred processing
-    [pendingResolutions addObject:[^{
-      [resolve callWithArguments:@[s]];
-    } copy]];
+  } copy]];
 
-    // Self-drain: if we're the outermost delegate that triggered queueing,
-    // process the queue iteratively at THIS stack depth. Each item resets
-    // resolveCount and triggers up to kMaxResolveBatch synchronous resolves.
-    // Nested delegate calls that exceed the batch limit just queue (isDraining
-    // prevents re-entering the while loop), keeping max stack depth bounded
-    // to ~2 * kMaxResolveBatch levels.
-    if (!isDraining) {
-      isDraining = YES;
-      while (pendingResolutions.count > 0) {
-        resolveCount = 0;
-        void (^block)(void) = pendingResolutions[0];
-        [pendingResolutions removeObjectAtIndex:0];
-        block();
-      }
-      isDraining = NO;
+  if (!isDraining) {
+    isDraining = YES;
+    while (pendingResolutions.count > 0) {
+      void (^block)(void) = pendingResolutions[0];
+      [pendingResolutions removeObjectAtIndex:0];
+      block();
     }
+    isDraining = NO;
   }
 }
 
@@ -282,14 +264,21 @@ js__module_delegate_drain_one(void *delegate) {
   JSCModuleDelegate *d = (__bridge JSCModuleDelegate *)delegate;
   if (d->pendingResolutions.count == 0) return 0;
 
-  // Pop the first queued resolution and execute it.
-  // Reset the batch counter so the new resolve call can trigger
-  // up to kMaxResolveBatch synchronous resolutions before queuing again.
-  d->resolveCount = 0;
-
+  // Pop and resolve one queued module. The resolve may trigger further
+  // delegate calls which queue more items. isDraining is set so nested
+  // calls don't re-enter the while loop in the delegate.
+  d->isDraining = YES;
   void (^block)(void) = d->pendingResolutions[0];
   [d->pendingResolutions removeObjectAtIndex:0];
   block();
+
+  // Continue draining any items queued by the resolve
+  while (d->pendingResolutions.count > 0) {
+    block = d->pendingResolutions[0];
+    [d->pendingResolutions removeObjectAtIndex:0];
+    block();
+  }
+  d->isDraining = NO;
 
   return 1;
 }
