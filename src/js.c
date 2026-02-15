@@ -1588,95 +1588,56 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
 
   env->depth++;
 
-  // Evaluate the module script. The delegate will provide all
-  // pre-resolved dependencies from its registry.
-  JSValueRef jsc_promise = js__module_script_evaluate(
-    env->objc_context, module->jsc_script);
-
-  env->depth--;
-
-  if (jsc_promise == NULL) {
-    if (env->exception) return js__propagate_exception(env);
-
-    int err = js_throw_error(env, NULL, "Module evaluation returned NULL");
-    assert(err == 0);
-    return js__error(env);
-  }
-
-  // Track the promise state. The JSC promise doesn't support __ps private
-  // properties, so we chain it to a deferred promise we create ourselves.
-  // Set the JSC promise on a temp global, chain .then/.catch to capture
-  // state, drain microtasks, then create our tracked promise.
-
   JSObjectRef global = JSContextGetGlobalObject(env->context);
 
-  JSStringRef mp_key = JSStringCreateWithUTF8CString("__jsc_mp");
-  JSObjectSetProperty(env->context, global, mp_key, jsc_promise, 0, NULL);
-  JSStringRelease(mp_key);
-
-  // Set up state tracking for the evaluation promise
-  JSStringRef chain_code = JSStringCreateWithUTF8CString(
-    "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined;"
-    "__jsc_mp.then("
-    "  function(v) { globalThis.__jsc_ms = 1; globalThis.__jsc_mr = v; },"
-    "  function(r) { globalThis.__jsc_ms = 2; globalThis.__jsc_mr = r; }"
-    ")");
-  JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
-  JSStringRelease(chain_code);
-
-  // Drain microtasks to resolve the evaluation promise
-  for (int i = 0; i < 4; i++) {
-    JSStringRef drain = JSStringCreateWithUTF8CString("0");
-    JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
-    JSStringRelease(drain);
-  }
-
-  // Now capture namespace via a separate import() call.
-  // The module should be cached by JSC from the evaluation above.
+  // Build the module URL for import()
   char mod_url[4096];
   snprintf(mod_url, sizeof(mod_url), "file:///bare-modules/%s", module->name);
 
+  // Use import() to evaluate the module and capture its namespace in one step.
+  // import() goes through the delegate (which has all modules pre-registered)
+  // and handles the full dependency resolution + evaluation + namespace.
   char import_buf[8192];
   snprintf(import_buf, sizeof(import_buf),
-    "globalThis.__jsc_mns = undefined;"
+    "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined; globalThis.__jsc_mns = undefined;"
     "import('%s').then("
-    "  function(ns) { globalThis.__jsc_mns = ns; },"
-    "  function(e) { globalThis.__jsc_mns = null; }"
+    "  function(ns) { globalThis.__jsc_ms = 1; globalThis.__jsc_mr = ns; globalThis.__jsc_mns = ns; },"
+    "  function(e) { globalThis.__jsc_ms = 2; globalThis.__jsc_mr = e; globalThis.__jsc_mns = null; }"
     ")", mod_url);
   JSStringRef import_code = JSStringCreateWithUTF8CString(import_buf);
   JSEvaluateScript(env->context, import_code, NULL, NULL, 0, NULL);
   JSStringRelease(import_code);
 
-  // Drain microtasks aggressively for the import() to resolve
-  for (int i = 0; i < 8; i++) {
-    JSStringRef drain = JSStringCreateWithUTF8CString("0");
-    JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
-    JSStringRelease(drain);
+  // Drain microtasks in a loop until the import() promise resolves.
+  // Each JSEvaluateScript call implicitly drains the microtask queue,
+  // which triggers JSC's internal module resolution (delegate calls).
+  // Deep module trees require many drain cycles — one per dependency level.
+  JSStringRef check = JSStringCreateWithUTF8CString("globalThis.__jsc_ms");
+  int state = 0;
+  int iterations = 0;
+  for (; iterations < 10000 && state == 0; iterations++) {
+    JSValueRef val = JSEvaluateScript(env->context, check, NULL, NULL, 0, NULL);
+    state = (int) JSValueToNumber(env->context, val, NULL);
+  }
+  JSStringRelease(check);
+
+  env->depth--;
+
+  {
+    char logbuf[256];
+    snprintf(logbuf, sizeof(logbuf), "js_run_module: state=%d, iterations=%d", state, iterations);
+    js__nslog(logbuf);
   }
 
-  // Read the state
-  JSStringRef ms_key = JSStringCreateWithUTF8CString("__jsc_ms");
-  JSValueRef ms_val = JSObjectGetProperty(env->context, global, ms_key, NULL);
-  JSStringRelease(ms_key);
-  int state = (int) JSValueToNumber(env->context, ms_val, NULL);
-
+  // Read the result value
   JSStringRef mr_key = JSStringCreateWithUTF8CString("__jsc_mr");
   JSValueRef mr_val = JSObjectGetProperty(env->context, global, mr_key, NULL);
   JSStringRelease(mr_key);
 
-  // Capture the module namespace from the import() chain
+  // Capture the module namespace
   JSStringRef mns_key = JSStringCreateWithUTF8CString("__jsc_mns");
   JSValueRef mns_val = JSObjectGetProperty(env->context, global, mns_key, NULL);
   JSStringRelease(mns_key);
-
-  {
-    char logbuf[256];
-    snprintf(logbuf, sizeof(logbuf), "js_run_module: state=%d, namespace=%s",
-             state,
-             JSValueIsUndefined(env->context, mns_val) ? "undefined" :
-             JSValueIsNull(env->context, mns_val) ? "null" : "captured");
-    js__nslog(logbuf);
-  }
 
   if (!JSValueIsUndefined(env->context, mns_val) && !JSValueIsNull(env->context, mns_val)) {
     module->namespace_ref = mns_val;
@@ -1715,21 +1676,17 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSStringRelease(pr_key);
 
   // Clean up temp globals
-  JSStringRef del1 = JSStringCreateWithUTF8CString("__jsc_mp");
-  JSObjectDeleteProperty(env->context, global, del1, NULL);
-  JSStringRelease(del1);
+  JSStringRef del_ms = JSStringCreateWithUTF8CString("__jsc_ms");
+  JSObjectDeleteProperty(env->context, global, del_ms, NULL);
+  JSStringRelease(del_ms);
 
-  JSStringRef del2 = JSStringCreateWithUTF8CString("__jsc_ms");
-  JSObjectDeleteProperty(env->context, global, del2, NULL);
-  JSStringRelease(del2);
+  JSStringRef del_mr = JSStringCreateWithUTF8CString("__jsc_mr");
+  JSObjectDeleteProperty(env->context, global, del_mr, NULL);
+  JSStringRelease(del_mr);
 
-  JSStringRef del3 = JSStringCreateWithUTF8CString("__jsc_mr");
-  JSObjectDeleteProperty(env->context, global, del3, NULL);
-  JSStringRelease(del3);
-
-  JSStringRef del4 = JSStringCreateWithUTF8CString("__jsc_mns");
-  JSObjectDeleteProperty(env->context, global, del4, NULL);
-  JSStringRelease(del4);
+  JSStringRef del_mns = JSStringCreateWithUTF8CString("__jsc_mns");
+  JSObjectDeleteProperty(env->context, global, del_mns, NULL);
+  JSStringRelease(del_mns);
 
   *result = (js_value_t *) tracked;
 
