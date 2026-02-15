@@ -218,8 +218,7 @@ list(APPEND skipped_tests
   create-sharedarraybuffer
   create-sharedarraybuffer-with-backing-store
 
-  # https://bugs.webkit.org/show_bug.cgi?id=261600 (partially implemented via Obj-C API)
-  # Phase 2: still skipped
+  # https://bugs.webkit.org/show_bug.cgi?id=261600
   dynamic-import
   dynamic-import-with-promise
   dynamic-import-without-handler
