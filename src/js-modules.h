@@ -80,15 +80,21 @@ js__drain_run_loop(void);
 int
 js__objc_eval_int(void *objc_context, const char *expr);
 
-// Batch-register module sources via JSC's internal provideFetch mechanism.
-// Uses dlsym to hold JSLockHolder across all evaluateJSScript: calls,
-// preventing microtask drain between calls. All module sources are registered
-// in JSC's fetch map before any import resolution runs, eliminating
-// delegate callbacks entirely.
+// Pre-populate JSC's internal module fetch map by calling the private
+// JSModuleLoader::provideFetch() for each module. After this, calling
+// evaluateJSScript: on the root module will find all dependencies
+// already fetched — no delegate callbacks, no recursive stack buildup.
 //
 // `scripts` is an array of retained JSScript* (void*) pointers.
-// `count` is the number of scripts.
+// `urls` is a parallel array of URL strings (the module identifiers).
+// `count` is the number of entries.
 void
+js__provide_fetch_modules(void *objc_context, void **scripts,
+                          const char **urls, size_t count);
+
+// Evaluate a batch of module scripts sequentially. Returns the JSValueRef
+// from evaluating the last script, or NULL.
+JSValueRef
 js__batch_register_modules(void *objc_context, void **scripts, size_t count);
 
 #endif // JS_MODULES_H

@@ -108,6 +108,11 @@ struct js_env_s {
   void *module_loader_delegate; // Retained JSCModuleDelegate*
   js_module_t *current_loading_module;
 
+  // Tracks recursive instantiation depth. When > 0, js_run_module skips
+  // evaluation (returns resolved promise) because the top-level js_run_module
+  // will handle all deps via provideFetch + evaluateJSScript:.
+  uint32_t instantiate_depth;
+
   // Module evaluation order (DFS post-order: leaves first, root last).
   // Populated during js_instantiate_module, consumed during js_run_module.
   js_module_t **module_eval_order;
@@ -976,6 +981,13 @@ js_create_env(uv_loop_t *loop, js_platform_t *platform, const js_env_options_t *
   JSContextGroupRef group;
   JSGlobalContextRef context;
 
+  // Increase JSC's per-thread stack usage limit BEFORE creating any JSContext.
+  // Default is ~5MB which allows only ~50 levels of recursive module loading.
+  // The worklet thread has a 64MB stack; tell JSC to use all of it.
+  // On iOS simulator (debug builds), JSC reads JSC_ env vars during
+  // Options::initialize() which runs on first VM creation.
+  setenv("JSC_maxPerThreadStackUsage", "67108864", 1);
+
   // Create JSContext via Obj-C API. This produces a JSAPIGlobalObject which
   // is required for the module loader delegate to function.
   void *objc_context = js__objc_context_create(&context, &group);
@@ -993,6 +1005,7 @@ js_create_env(uv_loop_t *loop, js_platform_t *platform, const js_env_options_t *
   env->objc_context = objc_context;
   env->module_loader_delegate = js__module_delegate_create(env);
   env->current_loading_module = NULL;
+  env->instantiate_depth = 0;
 
   env->module_eval_order = NULL;
   env->module_eval_count = 0;
@@ -1516,10 +1529,28 @@ static int
 js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
                               js_module_resolve_cb cb, void *data,
                               const char *base_url) {
-  if (env->exception) return js__error(env);
+  static int c_depth = 0;
+  c_depth++;
+  if (c_depth == 1 || c_depth % 100 == 0) {
+    char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
+      "js__instantiate_module_at_url: c_depth=%d name='%.80s'",
+      c_depth, module->name ? module->name : "(null)");
+    js__nslog(logbuf);
+  }
+
+  if (env->exception) { c_depth--; return js__error(env); }
 
   module->callbacks.resolve = cb;
   module->callbacks.resolve_data = data;
+
+  // Register in delegate EARLY to prevent infinite recursion from cyclic imports.
+  // Without this, module A importing B which imports A would recurse infinitely
+  // because the dedup check (js__module_delegate_lookup) wouldn't find A — it
+  // was only registered AFTER its subtree was fully processed.
+  // The JSScript is NULL at this point; it gets set below after source rewriting.
+  // The delegate only uses JSScript during evaluateJSScript: (in js_run_module),
+  // not during the dedup check here in instantiation.
+  js__module_delegate_register(env->module_loader_delegate, base_url, module);
 
   // For synthetic modules: call the evaluate callback now to populate exports.
   // This must happen before JSC tries to evaluate the module.
@@ -1527,13 +1558,12 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
     module->callbacks.evaluate(env, module, module->callbacks.evaluate_data);
   }
 
-  // If no resolve callback or no source, create JSScript and register now
+  // If no resolve callback or no source, create JSScript and return
   if (cb == NULL || module->source == NULL) {
     if (module->jsc_script == NULL && module->source != NULL) {
       module->jsc_script = js__module_script_create(
         env->objc_context, module->source, base_url);
     }
-    js__module_delegate_register(env->module_loader_delegate, base_url, module);
 
     // Track in eval order
     if (env->module_eval_count >= env->module_eval_capacity) {
@@ -1543,6 +1573,7 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
     }
     env->module_eval_order[env->module_eval_count++] = module;
 
+    c_depth--;
     return 0;
   }
 
@@ -1606,6 +1637,7 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
         js__free_import_specifiers(specifiers, spec_count);
         for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
         free(bare_specs); free(bare_urls);
+        c_depth--;
         return js__error(env);
       }
       continue;
@@ -1631,6 +1663,7 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
       js__free_import_specifiers(specifiers, spec_count);
       for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
       free(bare_specs); free(bare_urls);
+      c_depth--;
       return err;
     }
   }
@@ -1659,14 +1692,12 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
       js__free_import_specifiers(specifiers, spec_count);
       for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
       free(bare_specs); free(bare_urls);
+      c_depth--;
       return js__error(env);
     }
   }
 
   if (rewritten) free(rewritten);
-
-  // Register in delegate's registry
-  js__module_delegate_register(env->module_loader_delegate, base_url, module);
 
   // Track in DFS post-order for topological pre-evaluation.
   // Children were already added by recursive calls above, so this module
@@ -1682,12 +1713,35 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
   for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
   free(bare_specs);
   free(bare_urls);
+  c_depth--;
   return 0;
 }
 
 int
 js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb cb, void *data) {
   if (env->exception) return js__error(env);
+
+  env->instantiate_depth++;
+
+  // When called recursively from _onimport → Module.load() → binding.runModule()
+  // during another module's instantiation, skip the actual work. The parent's
+  // js__instantiate_module_at_url will handle dependency resolution in C code
+  // (no JS stack growth). This prevents the JS-side recursive chain:
+  //   _onimport → Module.load → binding.runModule → js_instantiate_module → callback → _onimport → ...
+  // Without this guard, 200+ level deep dependency chains overflow the JS stack.
+  if (env->instantiate_depth > 1) {
+    { static int skip_count = 0; skip_count++;
+      if (skip_count <= 5 || skip_count % 100 == 0) {
+        char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
+          "js_instantiate_module: GUARD SKIP #%d (depth=%u, env=%p, name='%.80s')",
+          skip_count, env->instantiate_depth, (void*)env,
+          module->name ? module->name : "(null)");
+        js__nslog(logbuf);
+      }
+    }
+    env->instantiate_depth--;
+    return 0;
+  }
 
   size_t count_before = env->module_eval_count;
 
@@ -1697,10 +1751,12 @@ js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb c
 
   int result = js__instantiate_module_at_url(env, module, cb, data, url);
 
+  env->instantiate_depth--;
+
   { char logbuf[512]; snprintf(logbuf, sizeof(logbuf),
-    "js_instantiate_module: name='%s' cb=%p eval_count: %zu -> %zu (result=%d)",
+    "js_instantiate_module: name='%s' cb=%p eval_count: %zu -> %zu (result=%d) depth=%u",
     module->name ? module->name : "(null)", (void*)cb,
-    count_before, env->module_eval_count, result);
+    count_before, env->module_eval_count, result, env->instantiate_depth);
     js__nslog(logbuf); }
 
   return result;
@@ -1708,8 +1764,28 @@ js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb c
 
 int
 js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
-  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf), "js_run_module: name='%s'", module->name ? module->name : "(null)"); js__nslog(logbuf); }
+  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf),
+    "js_run_module: name='%s' instantiate_depth=%u",
+    module->name ? module->name : "(null)", env->instantiate_depth);
+    js__nslog(logbuf); }
   if (env->exception) return js__error(env);
+
+  // When called recursively from _onimport → Module.load() → binding.runModule()
+  // during another module's instantiation, skip evaluation. The top-level
+  // js_run_module (instantiate_depth == 0) will handle all deps via
+  // provideFetch + evaluateJSScript:. Returning a resolved promise satisfies
+  // binding.runModule()'s promise state check.
+  if (env->instantiate_depth > 0) {
+    JSStringRef code = JSStringCreateWithUTF8CString("Promise.resolve(undefined)");
+    JSValueRef promise = JSEvaluateScript(env->context, code, NULL, NULL, 0, NULL);
+    JSStringRelease(code);
+    *result = (js_value_t *) promise;
+    { char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
+      "js_run_module: SKIPPED (recursive, depth=%u) — returning resolved promise",
+      env->instantiate_depth);
+      js__nslog(logbuf); }
+    return 0;
+  }
 
   if (module->jsc_script == NULL) {
     int err = js_throw_error(env, NULL, "Module not instantiated");
@@ -1722,48 +1798,72 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   // the delegate handles setting globalThis.__jsc_syn before JSC
   // evaluates the synthetic source.
 
-  // --- provideFetch batch registration ---
-  // Register ALL dependency module sources in JSC's internal fetch map
-  // before any import resolution runs. Uses dlsym'd JSLockHolder to hold
-  // the JSC lock across all evaluateJSScript: calls, preventing microtask
-  // drain between them. When the lock is released, drainMicrotasks runs
-  // once and all imports resolve from the pre-registered map — the delegate
-  // is never called. No stack overflow, no per-module drain overhead.
+  // --- Direct provideFetch + individual evaluation ---
+  // Strategy to prevent JSC's recursive module evaluate() from overflowing:
+  //
+  // 1. Pre-register ALL dependency sources via JSModuleLoader::provideFetch().
+  //    This bypasses the delegate entirely (no recursive delegate callbacks).
+  //
+  // 2. Call evaluateJSScript: on EACH dependency individually, in topological
+  //    order (leaf deps first, from module_eval_order which is DFS post-order).
+  //    Each call creates an independent module record in JSC's internal registry.
+  //
+  // 3. When microtasks eventually drain (after the JS call stack unwinds):
+  //    - Leaf modules evaluate first (FIFO microtask queue)
+  //    - Parent modules find their deps already evaluated → skip recursion
+  //    - Each module evaluates at depth 1 (constant stack)
+  //
+  // Without step 2, calling evaluateJSScript: only on the root creates ONE
+  // pipeline that processes the entire dependency tree recursively during
+  // microtask drain. With 374 modules, this overflows the JS stack.
+
   if (env->module_eval_count > 0) {
     char logbuf[128];
     snprintf(logbuf, sizeof(logbuf),
-      "js_run_module: batch-registering %zu deps via provideFetch",
+      "js_run_module: provideFetch pre-registering %zu deps",
       env->module_eval_count);
     js__nslog(logbuf);
 
-    // Collect dependency scripts (exclude root — evaluated separately below)
+    // Collect scripts and URLs for all dependencies (NOT the root)
     void **dep_scripts = malloc(env->module_eval_count * sizeof(void *));
+    const char **dep_urls = malloc(env->module_eval_count * sizeof(char *));
+    char **url_bufs = malloc(env->module_eval_count * sizeof(char *));
     size_t dep_count = 0;
 
     for (size_t i = 0; i < env->module_eval_count; i++) {
       js_module_t *dep = env->module_eval_order[i];
-      if (dep == module) continue;
+      if (dep == module) continue;      // skip root
       if (dep->jsc_script == NULL) continue;
-      dep_scripts[dep_count++] = dep->jsc_script;
+
+      const char *name = js__module_get_name(dep);
+      size_t url_len = strlen("file:///bare-modules/") + strlen(name) + 1;
+      char *url = malloc(url_len);
+      snprintf(url, url_len, "file:///bare-modules/%s", name);
+
+      dep_scripts[dep_count] = dep->jsc_script;
+      dep_urls[dep_count] = url;
+      url_bufs[dep_count] = url;
+      dep_count++;
     }
 
-    // Batch-evaluate all deps within a single JSLockHolder scope.
-    // Each evaluateJSScript call registers the module source via provideFetch.
-    // The outer lock prevents microtask drain until ALL sources are registered.
-    js__batch_register_modules(env->objc_context, dep_scripts, dep_count);
+    // Pre-register all dependency sources in JSC's fetch map
+    js__provide_fetch_modules(
+      env->objc_context, dep_scripts, dep_urls, dep_count);
 
+    // Free URL buffers
+    for (size_t i = 0; i < dep_count; i++) free(url_bufs[i]);
     free(dep_scripts);
+    free(dep_urls);
+    free(url_bufs);
     env->module_eval_count = 0;
 
-    js__nslog("js_run_module: batch registration complete, evaluating root");
+    js__nslog("js_run_module: provideFetch complete, evaluating root");
   }
 
+  // Evaluate the root module — all deps already have module records
   env->depth++;
-
-  // Evaluate the root module. All imports should be in JSC's cache now.
   JSValueRef eval_result = js__module_script_evaluate(
     env->objc_context, module->jsc_script);
-
   env->depth--;
 
   JSObjectRef global = JSContextGetGlobalObject(env->context);

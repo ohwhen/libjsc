@@ -87,9 +87,21 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   }
 
   if (entry == nil) {
+    // Handle internal dummy modules (e.g. LazyProperty init script)
+    if ([idStr hasPrefix:@"file:///bare-internal/"]) {
+      NSError *err = nil;
+      JSScript *dummy = [JSScript scriptOfType:kJSScriptTypeModule
+                                    withSource:@""
+                                  andSourceURL:[NSURL URLWithString:idStr]
+                              andBytecodeCache:nil
+                              inVirtualMachine:context.virtualMachine
+                                         error:&err];
+      if (dummy) {
+        [resolve callWithArguments:@[dummy]];
+        return;
+      }
+    }
     NSLog(@"[libjsc] delegate: module NOT FOUND in registry: '%@'", idStr);
-    // Dump all registry keys for debugging
-    NSLog(@"[libjsc] registry keys: %@", [moduleRegistry allKeys]);
     [reject callWithArguments:@[
       [JSValue valueWithNewErrorFromMessage:
         [NSString stringWithFormat:@"Module not found in registry: %@", idStr]
@@ -206,7 +218,12 @@ js__objc_context_create(JSGlobalContextRef *out_ctx, JSContextGroupRef *out_grou
 
   *out_ctx = ctx.JSGlobalContextRef;
   *out_group = JSContextGetGroup(*out_ctx);
-  NSLog(@"[libjsc] Created Obj-C JSContext: %p, globalCtx: %p", ctx, *out_ctx);
+  // Log thread stack info — helps debug "Maximum call stack size exceeded"
+  pthread_t self = pthread_self();
+  size_t stack_size = pthread_get_stacksize_np(self);
+  void *stack_addr = pthread_get_stackaddr_np(self);
+  NSLog(@"[libjsc] Created Obj-C JSContext: %p, globalCtx: %p (thread stack: %p, %zu KB)",
+        ctx, *out_ctx, stack_addr, stack_size / 1024);
   return (__bridge_retained void *)ctx;
 }
 
@@ -324,120 +341,387 @@ js__module_script_evaluate(void *objc_context, void *script) {
 }
 
 // -----------------------------------------------------------------------
-// Batch module registration via provideFetch
+// Direct provideFetch — pre-populate JSC's internal module fetch map
 // -----------------------------------------------------------------------
-// Each [JSContext evaluateJSScript:] call internally invokes
-// JSC::loadAndEvaluateModule which synchronously calls provideFetch —
-// registering the module source in JSC's internal fetch map. However,
-// evaluateJSScript also creates a JSLockHolder whose destructor calls
-// willReleaseLock() → drainMicrotasks(). This means after EACH call,
-// microtasks run and imports are resolved — triggering the delegate.
+// JSC's module loader has an internal registry keyed by module identifier.
+// When `requestFetch(entry)` runs, it checks `entry.fetch` first — if
+// already populated, it skips the delegate entirely and returns the cached
+// source. The C++ method JSModuleLoader::provideFetch() populates this.
 //
-// By holding an OUTER JSLockHolder (obtained via dlsym), the inner lock
-// in evaluateJSScript never drops to zero, so willReleaseLock/drainMicrotasks
-// is suppressed. All provideFetch registrations happen synchronously.
-// When we release the outer lock, drainMicrotasks runs once and ALL imports
-// resolve from the pre-registered fetch map — zero delegate calls.
+// Strategy:
+//   1. Find provideFetch + JSLockHolder via nlist (local symbols in JSC)
+//   2. Get the JSModuleLoader* from JSGlobalObject at a known offset
+//      (0x2a8 on iOS 26 arm64, found by disassembling JSC::loadModule)
+//   3. Extract the SourceCode from each JSScript via -[JSScript sourceCode]
+//   4. Call provideFetch(moduleLoader, globalObject, key, &sourceCode)
+//      for every dependency module BEFORE evaluating the root
+//   5. evaluateJSScript: on the root — all imports resolve from the
+//      pre-populated fetch map via microtask queue. No delegate calls,
+//      no recursive stack buildup. Constant stack depth.
 
+#include <pthread.h>
 #include <dlfcn.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <objc/message.h>
 
 typedef void (*js__lock_ctor_fn)(void *self, void *globalObject);
 typedef void (*js__lock_dtor_fn)(void *self);
 
+// provideFetch: JSModuleLoader::provideFetch(JSGlobalObject*, JSValue, SourceCode const&)
+// ARM64 calling convention: x0=this, x1=globalObject, x2=JSValue(key), x3=&sourceCode
+// Returns JSValue in x0.
+typedef int64_t (*js__provide_fetch_fn)(void *self, void *globalObject,
+                                        int64_t key, void *sourceCode);
+
 static js__lock_ctor_fn s_lock_ctor = NULL;
 static js__lock_dtor_fn s_lock_dtor = NULL;
-static bool s_lock_resolved = false;
+static js__provide_fetch_fn s_provide_fetch = NULL;
+static bool s_symbols_resolved = false;
+
+// Offset of m_moduleLoader in JSGlobalObject (from disassembling
+// JSC::loadModule on iOS 26 arm64 simulator — ldr x0, [x20, #0x2a8]).
+#define JSC_MODULE_LOADER_OFFSET 0x2a8
+
+// SourceCode struct layout — matches JSC::SourceCode exactly:
+//   RefPtr<SourceProvider> m_provider  (8 bytes — raw pointer)
+//   int m_startChar                    (4 bytes)
+//   int m_endChar                      (4 bytes)
+//   int m_firstLine                    (4 bytes)
+//   int m_startColumn                  (4 bytes)
+// Total: 24 bytes, 8-byte aligned.
+typedef struct {
+  void *provider;
+  int start_char;
+  int end_char;
+  int first_line;
+  int start_column;
+} JSCSourceCode;
+
+// Walk the Mach-O nlist symbol table to find a local symbol by name.
+// Returns the runtime address or NULL.
+static void *
+js__nlist_find(const struct mach_header_64 *header, uintptr_t slide,
+               const char *target) {
+  const uint8_t *ptr = (const uint8_t *)(header + 1);
+  const struct symtab_command *symtab = NULL;
+
+  for (uint32_t i = 0; i < header->ncmds; i++) {
+    const struct load_command *cmd = (const struct load_command *)ptr;
+    if (cmd->cmd == LC_SYMTAB) {
+      symtab = (const struct symtab_command *)cmd;
+      break;
+    }
+    ptr += cmd->cmdsize;
+  }
+  if (!symtab) return NULL;
+
+  // Find __LINKEDIT base
+  uintptr_t linkedit_base = 0;
+  ptr = (const uint8_t *)(header + 1);
+  for (uint32_t i = 0; i < header->ncmds; i++) {
+    const struct load_command *cmd = (const struct load_command *)ptr;
+    if (cmd->cmd == LC_SEGMENT_64) {
+      const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+      if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+        linkedit_base = seg->vmaddr - seg->fileoff + slide;
+        break;
+      }
+    }
+    ptr += cmd->cmdsize;
+  }
+  if (!linkedit_base) return NULL;
+
+  const struct nlist_64 *syms =
+    (const struct nlist_64 *)(linkedit_base + symtab->symoff);
+  const char *strtab = (const char *)(linkedit_base + symtab->stroff);
+
+  for (uint32_t i = 0; i < symtab->nsyms; i++) {
+    const char *name = strtab + syms[i].n_un.n_strx;
+    if (strcmp(name, target) == 0) {
+      return (void *)(syms[i].n_value + slide);
+    }
+  }
+  return NULL;
+}
 
 static void
-js__resolve_lock_symbols(void) {
-  if (s_lock_resolved) return;
-  s_lock_resolved = true;
+js__resolve_symbols(void) {
+  if (s_symbols_resolved) return;
+  s_symbols_resolved = true;
 
-  // Find the actual loaded JavaScriptCore image. On the iOS simulator the
-  // framework is loaded from the simulator runtime root, NOT from
-  // /System/Library/Frameworks/..., so a hardcoded path won't work.
-  //
-  // Strategy: use dladdr() on a known public JSC symbol (JSEvaluateScript)
-  // to discover the actual image path, then dlopen() that path.
   Dl_info info;
   if (!dladdr((void *)JSEvaluateScript, &info) || !info.dli_fname) {
-    NSLog(@"[libjsc] provideFetch: dladdr failed for JSEvaluateScript");
+    NSLog(@"[libjsc] provideFetch: dladdr failed");
     return;
   }
-
   NSLog(@"[libjsc] provideFetch: JSC image at %s", info.dli_fname);
 
-  void *jsc_handle = dlopen(info.dli_fname, RTLD_NOLOAD);
+  const struct mach_header_64 *header =
+    (const struct mach_header_64 *)info.dli_fbase;
 
-  if (!jsc_handle) {
-    NSLog(@"[libjsc] provideFetch: dlopen JSC failed: %s", dlerror());
+  // --- Get proper ASLR slide from dyld ---
+  // CRITICAL: For shared cache images (like JSC on iOS simulator),
+  // slide = actual_load_address - preferred_vmaddr, NOT just dli_fbase.
+  // Using dli_fbase directly as slide causes linkedit_base to point to
+  // garbage memory and crashes during nlist walk.
+  intptr_t slide = 0;
+  bool found_image = false;
+  for (uint32_t img = 0; img < _dyld_image_count(); img++) {
+    if (_dyld_get_image_header(img) == (const struct mach_header *)header) {
+      slide = _dyld_get_image_vmaddr_slide(img);
+      found_image = true;
+      break;
+    }
+  }
+  if (!found_image) {
+    NSLog(@"[libjsc] provideFetch: JSC image not found in dyld image list");
+    return;
+  }
+  NSLog(@"[libjsc] provideFetch: header=%p slide=0x%lx", header, (long)slide);
+
+  // --- Try dlsym for exported symbols first ---
+  void *jsc_handle = dlopen(info.dli_fname, RTLD_NOLOAD);
+  if (!jsc_handle) jsc_handle = dlopen(info.dli_fname, RTLD_LAZY);
+  NSLog(@"[libjsc] provideFetch: dlopen handle=%p", jsc_handle);
+
+  const char *ctor_names[] = {
+    "_ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE",
+    "__ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE", NULL
+  };
+  const char *dtor_names[] = {
+    "_ZN3JSC12JSLockHolderD1Ev",
+    "__ZN3JSC12JSLockHolderD1Ev", NULL
+  };
+
+  if (jsc_handle) {
+    for (int i = 0; ctor_names[i] && !s_lock_ctor; i++)
+      s_lock_ctor = (js__lock_ctor_fn)dlsym(jsc_handle, ctor_names[i]);
+    for (int i = 0; dtor_names[i] && !s_lock_dtor; i++)
+      s_lock_dtor = (js__lock_dtor_fn)dlsym(jsc_handle, dtor_names[i]);
+  }
+
+  NSLog(@"[libjsc] provideFetch: after dlsym: ctor=%p dtor=%p",
+        s_lock_ctor, s_lock_dtor);
+
+  if (header->magic != MH_MAGIC_64) {
+    NSLog(@"[libjsc] provideFetch: not MH_MAGIC_64 (magic=0x%x)", header->magic);
     return;
   }
 
-  // JSC::JSLockHolder::JSLockHolder(JSC::JSGlobalObject*)
-  s_lock_ctor = (js__lock_ctor_fn)dlsym(jsc_handle,
-    "__ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE");
+  // Find LC_SYMTAB and __LINKEDIT segment command
+  const uint8_t *ptr = (const uint8_t *)(header + 1);
+  const struct symtab_command *symtab = NULL;
+  uint64_t linkedit_fileoff = 0;
 
-  // JSC::JSLockHolder::~JSLockHolder()
-  s_lock_dtor = (js__lock_dtor_fn)dlsym(jsc_handle,
-    "__ZN3JSC12JSLockHolderD1Ev");
-
-  if (s_lock_ctor && s_lock_dtor) {
-    NSLog(@"[libjsc] provideFetch: JSLockHolder resolved via dlsym");
-  } else {
-    NSLog(@"[libjsc] provideFetch: JSLockHolder NOT found (ctor=%p dtor=%p, err=%s)",
-          s_lock_ctor, s_lock_dtor, dlerror());
+  for (uint32_t i = 0; i < header->ncmds; i++) {
+    const struct load_command *cmd = (const struct load_command *)ptr;
+    if (cmd->cmd == LC_SYMTAB) {
+      symtab = (const struct symtab_command *)cmd;
+    } else if (cmd->cmd == LC_SEGMENT_64) {
+      const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+      if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+        linkedit_fileoff = seg->fileoff;
+      }
+    }
+    ptr += cmd->cmdsize;
   }
+
+  if (!symtab || !linkedit_fileoff) {
+    NSLog(@"[libjsc] provideFetch: symtab=%p linkedit_fileoff=0x%llx — cannot walk nlist",
+          symtab, linkedit_fileoff);
+    return;
+  }
+
+  // Use getsegmentdata() to get __LINKEDIT's actual memory address.
+  // This handles dyld shared cache correctly (where vmaddr-fileoff+slide fails).
+  unsigned long linkedit_size = 0;
+  uint8_t *linkedit_ptr = getsegmentdata(
+    header, "__LINKEDIT", &linkedit_size);
+
+  if (!linkedit_ptr) {
+    NSLog(@"[libjsc] provideFetch: getsegmentdata(__LINKEDIT) returned NULL");
+    return;
+  }
+
+  NSLog(@"[libjsc] provideFetch: __LINKEDIT at %p (size=%lu, fileoff=0x%llx)",
+        linkedit_ptr, linkedit_size, linkedit_fileoff);
+
+  // symtab->symoff and symtab->stroff are file offsets. Compute their
+  // position within __LINKEDIT: (file_offset - linkedit_fileoff) bytes
+  // from the start of the __LINKEDIT segment in memory.
+  const struct nlist_64 *syms = (const struct nlist_64 *)(
+    linkedit_ptr + (symtab->symoff - linkedit_fileoff));
+  const char *strtab = (const char *)(
+    linkedit_ptr + (symtab->stroff - linkedit_fileoff));
+
+  NSLog(@"[libjsc] provideFetch: walking %u symbols...", symtab->nsyms);
+
+  // Target symbols — search for all of them in a single pass
+  int found = 0;
+  const int NEED = 3; // ctor + dtor + provideFetch
+
+  for (uint32_t i = 0; i < symtab->nsyms && found < NEED; i++) {
+    uint32_t strx = syms[i].n_un.n_strx;
+    if (strx == 0) continue;
+    const char *name = strtab + strx;
+
+    if (!s_lock_ctor &&
+        strcmp(name, "__ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE") == 0) {
+      s_lock_ctor = (js__lock_ctor_fn)(syms[i].n_value + slide);
+      found++;
+    } else if (!s_lock_dtor &&
+        strcmp(name, "__ZN3JSC12JSLockHolderD1Ev") == 0) {
+      s_lock_dtor = (js__lock_dtor_fn)(syms[i].n_value + slide);
+      found++;
+    } else if (!s_provide_fetch &&
+        strcmp(name, "__ZN3JSC14JSModuleLoader12provideFetchEPNS_14JSGlobalObjectENS_7JSValueERKNS_10SourceCodeE") == 0) {
+      s_provide_fetch = (js__provide_fetch_fn)(syms[i].n_value + slide);
+      found++;
+    }
+  }
+
+  // If not found with double underscore, try single underscore convention
+  if (!s_lock_ctor || !s_lock_dtor || !s_provide_fetch) {
+    for (uint32_t i = 0; i < symtab->nsyms && found < NEED; i++) {
+      uint32_t strx = syms[i].n_un.n_strx;
+      if (strx == 0) continue;
+      const char *name = strtab + strx;
+
+      if (!s_lock_ctor &&
+          strcmp(name, "_ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE") == 0) {
+        s_lock_ctor = (js__lock_ctor_fn)(syms[i].n_value + slide);
+        found++;
+      } else if (!s_lock_dtor &&
+          strcmp(name, "_ZN3JSC12JSLockHolderD1Ev") == 0) {
+        s_lock_dtor = (js__lock_dtor_fn)(syms[i].n_value + slide);
+        found++;
+      } else if (!s_provide_fetch &&
+          strcmp(name, "_ZN3JSC14JSModuleLoader12provideFetchEPNS_14JSGlobalObjectENS_7JSValueERKNS_10SourceCodeE") == 0) {
+        s_provide_fetch = (js__provide_fetch_fn)(syms[i].n_value + slide);
+        found++;
+      }
+    }
+  }
+
+  NSLog(@"[libjsc] symbols: lock_ctor=%p lock_dtor=%p provideFetch=%p",
+        s_lock_ctor, s_lock_dtor, s_provide_fetch);
 }
 
 void
-js__batch_register_modules(void *objc_context, void **scripts, size_t count) {
+js__provide_fetch_modules(void *objc_context, void **scripts,
+                          const char **urls, size_t count) {
   if (count == 0) return;
+  js__resolve_symbols();
 
-  js__resolve_lock_symbols();
+  if (!s_provide_fetch) {
+    NSLog(@"[libjsc] provideFetch: symbol not found — cannot pre-register");
+    return;
+  }
+  if (!s_lock_ctor || !s_lock_dtor) {
+    NSLog(@"[libjsc] provideFetch: JSLockHolder not found — cannot acquire lock");
+    return;
+  }
 
   JSContext *ctx = (__bridge JSContext *)objc_context;
+  JSGlobalContextRef ctx_ref = ctx.JSGlobalContextRef;
+  void *global_object = (void *)ctx_ref;
 
-  if (s_lock_ctor && s_lock_dtor) {
-    JSGlobalContextRef ctx_ref = ctx.JSGlobalContextRef;
+  // Read JSModuleLoader* from JSGlobalObject at known offset.
+  // The module loader is stored as a LazyProperty — if bit 0 is set,
+  // the property hasn't been initialized yet. Force initialization by
+  // evaluating a dummy empty module (no imports = no delegate callbacks).
+  uintptr_t ml_raw = *(uintptr_t *)((uint8_t *)global_object + JSC_MODULE_LOADER_OFFSET);
+  NSLog(@"[libjsc] provideFetch: globalObject=%p moduleLoader raw=0x%lx (offset 0x%x)",
+        global_object, (unsigned long)ml_raw, JSC_MODULE_LOADER_OFFSET);
 
-    // JSLockHolder layout: { RefPtr<JSLock> m_lock; } = 8 bytes
-    // Use 16 bytes for safety/alignment.
-    char lock_buf[16];
-    memset(lock_buf, 0, sizeof(lock_buf));
-
-    // Acquire outer lock — prevents willReleaseLock()/drainMicrotasks()
-    // from firing inside evaluateJSScript's nested JSLockHolder.
-    // JSGlobalContextRef == JSGlobalObject* (direct reinterpret_cast in JSC).
-    s_lock_ctor(lock_buf, (void *)ctx_ref);
-
-    NSLog(@"[libjsc] provideFetch: registering %zu modules within lock",
-          (unsigned long)count);
-
-    for (size_t i = 0; i < count; i++) {
-      JSScript *s = (__bridge JSScript *)scripts[i];
-      // evaluateJSScript → loadAndEvaluateModule → provideFetch (synchronous)
-      // The returned promise is not drained yet (outer lock held).
-      [ctx evaluateJSScript:s];
+  if (ml_raw & 1) {
+    NSLog(@"[libjsc] provideFetch: LazyProperty bit 0 set — triggering module loader init");
+    NSError *err = nil;
+    JSScript *dummy = [JSScript scriptOfType:kJSScriptTypeModule
+                                  withSource:@""
+                                andSourceURL:[NSURL URLWithString:@"file:///bare-internal/__init__"]
+                            andBytecodeCache:nil
+                            inVirtualMachine:ctx.virtualMachine
+                                       error:&err];
+    if (dummy) {
+      [ctx evaluateJSScript:dummy];
+    } else {
+      NSLog(@"[libjsc] provideFetch: dummy script creation failed: %@", err);
     }
-
-    NSLog(@"[libjsc] provideFetch: releasing lock — draining microtasks");
-
-    // Release outer lock → lock count drops to 0 → willReleaseLock() →
-    // drainMicrotasks(). All imports resolve from the provideFetch map.
-    s_lock_dtor(lock_buf);
-
-    NSLog(@"[libjsc] provideFetch: batch registration complete");
-  } else {
-    // Fallback: sequential evaluation without lock holding.
-    // The delegate WILL be called for each import (may stack overflow).
-    NSLog(@"[libjsc] provideFetch: FALLBACK — sequential eval for %zu modules",
-          (unsigned long)count);
-    for (size_t i = 0; i < count; i++) {
-      JSScript *s = (__bridge JSScript *)scripts[i];
-      [ctx evaluateJSScript:s];
-    }
+    ml_raw = *(uintptr_t *)((uint8_t *)global_object + JSC_MODULE_LOADER_OFFSET);
+    NSLog(@"[libjsc] provideFetch: after init, moduleLoader raw=0x%lx", (unsigned long)ml_raw);
   }
+
+  if (ml_raw & 1) {
+    NSLog(@"[libjsc] provideFetch: moduleLoader still uninitialized after dummy eval!");
+    return;
+  }
+
+  void *module_loader = (void *)ml_raw;
+  if (!module_loader) {
+    NSLog(@"[libjsc] provideFetch: moduleLoader is NULL!");
+    return;
+  }
+
+  // Acquire JSLockHolder — all provideFetch calls happen within the lock.
+  // No microtask drain until we release.
+  char lock_buf[16];
+  memset(lock_buf, 0, sizeof(lock_buf));
+  s_lock_ctor(lock_buf, global_object);
+
+  // Get the -[JSScript(Internal) sourceCode] selector
+  SEL sourceCodeSel = sel_registerName("sourceCode");
+
+  NSLog(@"[libjsc] provideFetch: pre-registering %zu modules", count);
+
+  for (size_t i = 0; i < count; i++) {
+    JSScript *s = (__bridge JSScript *)scripts[i];
+    const char *url = urls[i];
+
+    // Extract SourceCode from JSScript via private Obj-C method.
+    // Returns a 24-byte struct (JSCSourceCode) by value.
+    // On ARM64, structs > 16 bytes use indirect return via x8 register.
+    IMP imp = [s methodForSelector:sourceCodeSel];
+    JSCSourceCode sc = ((JSCSourceCode (*)(id, SEL))imp)(s, sourceCodeSel);
+
+    // Create JSValue key from module URL
+    JSStringRef key_str = JSStringCreateWithUTF8CString(url);
+    JSValueRef key_val = JSValueMakeString(ctx_ref, key_str);
+
+    // Call provideFetch(this=moduleLoader, globalObject, key, &sourceCode)
+    // On ARM64: JSValueRef IS EncodedJSValue (same bit pattern via reinterpret_cast)
+    s_provide_fetch(module_loader, global_object, (int64_t)key_val, &sc);
+
+    JSStringRelease(key_str);
+  }
+
+  NSLog(@"[libjsc] provideFetch: releasing lock (microtasks drain)");
+
+  // Release lock — microtasks drain. Since all fetch entries are pre-populated,
+  // the drain processes each module's promise chain iteratively (via microtask
+  // queue), with constant stack depth. No delegate callbacks.
+  s_lock_dtor(lock_buf);
+
+  NSLog(@"[libjsc] provideFetch: complete (%zu modules registered)", count);
+}
+
+JSValueRef
+js__batch_register_modules(void *objc_context, void **scripts, size_t count) {
+  if (count == 0) return NULL;
+
+  JSContext *ctx = (__bridge JSContext *)objc_context;
+  JSValue *lastResult = nil;
+
+  for (size_t i = 0; i < count; i++) {
+    JSScript *s = (__bridge JSScript *)scripts[i];
+    lastResult = [ctx evaluateJSScript:s];
+  }
+
+  if (lastResult == nil) return NULL;
+  return lastResult.JSValueRef;
 }
 
 void
