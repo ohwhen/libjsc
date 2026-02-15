@@ -376,6 +376,27 @@ static js_value_t *
 js__on_unhandled_rejection(js_env_t *env, js_callback_info_t *info) {
   int err;
 
+  // Log the rejection reason before propagating
+  {
+    size_t argc = 2;
+    js_value_t *argv[2];
+    err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
+    assert(err == 0);
+
+    // argv[0] = promise, argv[1] = reason
+    JSStringRef reason_str = JSValueToStringCopy(env->context, (JSValueRef) argv[1], NULL);
+    if (reason_str) {
+      char buf[1024];
+      JSStringGetUTF8CString(reason_str, buf, sizeof(buf));
+      JSStringRelease(reason_str);
+      char logbuf[1100];
+      snprintf(logbuf, sizeof(logbuf), "UNHANDLED REJECTION: %s", buf);
+      js__nslog(logbuf);
+    } else {
+      js__nslog("UNHANDLED REJECTION: (could not convert reason to string)");
+    }
+  }
+
   if (env->callbacks.unhandled_rejection) {
     size_t argc = 2;
     js_value_t *argv[2];
@@ -1010,6 +1031,7 @@ js_get_bindings(js_env_t *env, js_value_t **result) {
 
 int
 js_run_script(js_env_t *env, const char *file, size_t len, int offset, js_value_t *source, js_value_t **result) {
+  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf), "js_run_script: file='%s'", file ? file : "(null)"); js__nslog(logbuf); }
   if (env->exception) return js__error(env);
 
   JSValueRef exception = NULL;
@@ -1292,6 +1314,7 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
 
   // Register in delegate's registry at the base_url
   js__module_delegate_register(env->module_loader_delegate, base_url, module);
+  { char logbuf[2200]; snprintf(logbuf, sizeof(logbuf), "registered module: url='%s' name='%s'", base_url, module->name); js__nslog(logbuf); }
 
   // For synthetic modules: call the evaluate callback now to populate exports.
   // This must happen before JSC tries to evaluate the module.
@@ -1306,14 +1329,17 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
   char **specifiers;
   size_t spec_count;
   js__extract_import_specifiers(module->source, &specifiers, &spec_count);
+  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf), "extracted %zu specifiers from '%s'", spec_count, module->name); js__nslog(logbuf); }
 
   // Resolve each dependency
   for (size_t i = 0; i < spec_count; i++) {
     // Compute the URL that JSC will resolve this specifier to
     char *child_url = js__resolve_module_url(specifiers[i], base_url);
+    { char logbuf[2200]; snprintf(logbuf, sizeof(logbuf), "resolving spec='%s' -> url='%s'", specifiers[i], child_url); js__nslog(logbuf); }
 
     // Skip if already registered (prevents cycles and duplicates)
     if (js__module_delegate_lookup(env->module_loader_delegate, child_url) != NULL) {
+      js__nslog("already registered, skipping");
       free(child_url);
       continue;
     }
@@ -1372,6 +1398,7 @@ js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb c
 
 int
 js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
+  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf), "js_run_module: name='%s'", module->name ? module->name : "(null)"); js__nslog(logbuf); }
   if (env->exception) return js__error(env);
 
   if (module->jsc_script == NULL) {

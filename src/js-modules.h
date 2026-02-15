@@ -57,4 +57,8 @@ js__objc_set_global_property(void *objc_context, const char *key, JSValueRef val
 JSGlobalContextRef
 js__objc_get_context_ref(void *objc_context);
 
+// Logging bridge — routes to NSLog so output appears in unified log
+void
+js__nslog(const char *msg);
+
 #endif // JS_MODULES_H

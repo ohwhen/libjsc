@@ -65,6 +65,8 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
            andRejectHandler:(JSValue *)reject {
 
   NSString *idStr = [identifier toString];
+  NSLog(@"[libjsc] delegate: fetch '%@' (registry has %lu entries)",
+        idStr, (unsigned long)moduleRegistry.count);
 
   // Look up in registry
   NSValue *entry = moduleRegistry[idStr];
@@ -82,8 +84,9 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   }
 
   if (entry == nil) {
-    fprintf(stderr, "[libjsc] delegate: module NOT FOUND in registry: '%s'\n",
-            idStr.UTF8String);
+    NSLog(@"[libjsc] delegate: module NOT FOUND in registry: '%@'", idStr);
+    // Dump all registry keys for debugging
+    NSLog(@"[libjsc] registry keys: %@", [moduleRegistry allKeys]);
     [reject callWithArguments:@[
       [JSValue valueWithNewErrorFromMessage:
         [NSString stringWithFormat:@"Module not found in registry: %@", idStr]
@@ -96,8 +99,7 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   void *script = js__module_get_script(module);
 
   if (script == NULL) {
-    fprintf(stderr, "[libjsc] delegate: module has no JSScript: '%s'\n",
-            idStr.UTF8String);
+    NSLog(@"[libjsc] delegate: module has no JSScript: '%@'", idStr);
     [reject callWithArguments:@[
       [JSValue valueWithNewErrorFromMessage:
         [NSString stringWithFormat:@"Module has no script: %@", idStr]
@@ -140,11 +142,23 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
 // C-callable bridge functions
 // -----------------------------------------------------------------------
 
+void
+js__nslog(const char *msg) {
+  NSLog(@"[libjsc] %s", msg);
+}
+
 void *
 js__objc_context_create(JSGlobalContextRef *out_ctx, JSContextGroupRef *out_group) {
   JSContext *ctx = [[JSContext alloc] init];
+
+  ctx.exceptionHandler = ^(JSContext *c, JSValue *exception) {
+    NSLog(@"[libjsc] JSContext exception: %@", exception);
+    NSLog(@"[libjsc] Exception stack: %@", [exception objectForKeyedSubscript:@"stack"]);
+  };
+
   *out_ctx = ctx.JSGlobalContextRef;
   *out_group = JSContextGetGroup(*out_ctx);
+  NSLog(@"[libjsc] Created Obj-C JSContext: %p, globalCtx: %p", ctx, *out_ctx);
   return (__bridge_retained void *)ctx;
 }
 
