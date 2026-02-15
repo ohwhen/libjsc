@@ -58,7 +58,7 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
 // Each level adds ~10 JS frames. At ~100 levels the JS stack overflows.
 // The drain loop in js_run_module pops one item from the queue per iteration,
 // resets the counter, and resolves it — starting a new batch.
-static const int kMaxResolveBatch = 50;
+static const int kMaxResolveBatch = 10;
 
 @implementation JSCModuleDelegate
 
