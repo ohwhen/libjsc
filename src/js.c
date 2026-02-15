@@ -1150,11 +1150,51 @@ js_get_module_name(js_env_t *env, js_module_t *module, const char **result) {
 
 int
 js_get_module_namespace(js_env_t *env, js_module_t *module, js_value_t **result) {
-  // Not implemented for Phase 1 — no tests require it yet.
-  int err;
-  err = js_throw_error(env, NULL, "Unsupported operation: js_get_module_namespace");
-  assert(err == 0);
-  return js__error(env);
+  if (env->exception) return js__error(env);
+
+  // Use dynamic import() to get the already-evaluated module's namespace.
+  // Since the module is cached by URL, this returns the cached namespace.
+  char code[1536];
+  snprintf(code, sizeof(code),
+    "globalThis.__jsc_ns = undefined; globalThis.__jsc_ns_err = undefined;"
+    "import('file:///bare-modules/%s').then("
+    "  function(ns) { globalThis.__jsc_ns = ns; },"
+    "  function(e) { globalThis.__jsc_ns_err = e; }"
+    ")", module->name);
+
+  JSStringRef code_str = JSStringCreateWithUTF8CString(code);
+  JSEvaluateScript(env->context, code_str, NULL, NULL, 0, NULL);
+  JSStringRelease(code_str);
+
+  // Drain microtasks
+  JSStringRef drain = JSStringCreateWithUTF8CString("0");
+  JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
+  JSStringRelease(drain);
+
+  JSObjectRef global = JSContextGetGlobalObject(env->context);
+  JSStringRef ns_key = JSStringCreateWithUTF8CString("__jsc_ns");
+  JSValueRef ns_val = JSObjectGetProperty(env->context, global, ns_key, NULL);
+  JSStringRelease(ns_key);
+
+  // Clean up
+  JSStringRef del1 = JSStringCreateWithUTF8CString("__jsc_ns");
+  JSObjectDeleteProperty(env->context, global, del1, NULL);
+  JSStringRelease(del1);
+
+  JSStringRef del2 = JSStringCreateWithUTF8CString("__jsc_ns_err");
+  JSObjectDeleteProperty(env->context, global, del2, NULL);
+  JSStringRelease(del2);
+
+  if (JSValueIsUndefined(env->context, ns_val)) {
+    int err = js_throw_error(env, NULL, "Failed to get module namespace");
+    assert(err == 0);
+    return js__error(env);
+  }
+
+  *result = (js_value_t *) ns_val;
+  js__attach_to_handle_scope(env, env->scope, ns_val);
+
+  return 0;
 }
 
 int
@@ -1268,9 +1308,12 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
 
   env->depth--;
 
-  env->current_loading_module = saved;
+  // NOTE: Do NOT restore current_loading_module yet. JSC defers import
+  // resolution to microtask drain time. The delegate needs current_loading_module
+  // set to route imports through the resolve callback.
 
   if (jsc_promise == NULL) {
+    env->current_loading_module = saved;
     if (env->exception) return js__propagate_exception(env);
 
     int err = js_throw_error(env, NULL, "Module evaluation returned NULL");
@@ -1299,10 +1342,14 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
   JSStringRelease(chain_code);
 
-  // Drain microtasks
+  // Drain microtasks — this is where JSC resolves imports via the delegate.
+  // current_loading_module must still be set here.
   JSStringRef drain = JSStringCreateWithUTF8CString("0");
   JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
   JSStringRelease(drain);
+
+  // NOW restore current_loading_module after imports are resolved.
+  env->current_loading_module = saved;
 
   // Read the state
   JSStringRef ms_key = JSStringCreateWithUTF8CString("__jsc_ms");
