@@ -133,7 +133,15 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
     }
   }
 
-  [resolve callWithArguments:@[(__bridge JSScript *)script]];
+  // Defer resolution to the next run loop iteration.
+  // Without this, JSC immediately evaluates the resolved module within the
+  // same call stack, recursively triggering more delegate calls. With 200+
+  // modules, this causes "Maximum call stack size exceeded".
+  // By deferring, each module resolution happens in a flat call stack.
+  JSScript *s = (__bridge JSScript *)script;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [resolve callWithArguments:@[s]];
+  });
 }
 
 @end

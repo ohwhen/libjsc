@@ -1759,7 +1759,7 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
     // The C API doesn't drain microtasks when called from within a
     // native function invoked by JavaScript (reentrancy guard).
     int iterations = 0;
-    for (; iterations < 500 && state == 0; iterations++) {
+    for (; iterations < 10000 && state == 0; iterations++) {
       js__drain_run_loop();
       state = js__objc_eval_int(env->objc_context, "globalThis.__jsc_ms");
     }
