@@ -1734,8 +1734,74 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
                                JSValueMakeNumber(env->context, 2));
     JSObjectSetPrivateProperty(env->context, tracked, pr_key, mr_val);
   } else {
+    // Module evaluation is pending (async — JSC reentrancy guard on iOS).
+    // This happens when js_run_module is called from within a JavaScript
+    // execution context: JSC suppresses microtask draining, so the module
+    // loader's delegate calls are deferred. The evaluateJSScript promise
+    // will resolve later when the JS call stack fully unwinds.
+
+    // 1. Create a placeholder namespace so getNamespace() doesn't crash.
+    //    It will be populated with real exports when the promise resolves.
+    JSObjectRef placeholder = JSObjectMake(env->context, NULL, NULL);
+    module->namespace_ref = (JSValueRef) placeholder;
+    JSValueProtect(env->context, module->namespace_ref);
+
+    // 2. Connect original evaluateJSScript promise → deferred promise.
+    //    When the original resolves (after microtask drain):
+    //    - Copy namespace exports to placeholder object
+    //    - Resolve/reject the deferred promise
+    //    Use an IIFE to capture values before we delete the temp globals.
+    JSStringRef ep_key = JSStringCreateWithUTF8CString("__jsc_ep");
+    JSObjectSetProperty(env->context, global, ep_key, eval_result, 0, NULL);
+    JSStringRelease(ep_key);
+
+    JSStringRef dr_key = JSStringCreateWithUTF8CString("__jsc_dres");
+    JSObjectSetProperty(env->context, global, dr_key, (JSValueRef)resolve_fn, 0, NULL);
+    JSStringRelease(dr_key);
+
+    JSStringRef dj_key = JSStringCreateWithUTF8CString("__jsc_drej");
+    JSObjectSetProperty(env->context, global, dj_key, (JSValueRef)reject_fn, 0, NULL);
+    JSStringRelease(dj_key);
+
+    JSStringRef ph_key = JSStringCreateWithUTF8CString("__jsc_ph");
+    JSObjectSetProperty(env->context, global, ph_key, (JSValueRef)placeholder, 0, NULL);
+    JSStringRelease(ph_key);
+
+    JSStringRef connect_code = JSStringCreateWithUTF8CString(
+      "(function(ep, ph, dres, drej) {"
+      "  ep.then(function(ns) {"
+      "    if (ns && typeof ns === 'object') {"
+      "      try {"
+      "        Reflect.ownKeys(ns).forEach(function(k) {"
+      "          try { ph[k] = ns[k]; } catch(e) {}"
+      "        });"
+      "      } catch(e) {}"
+      "    }"
+      "    dres(ns);"
+      "  }, drej);"
+      "})(globalThis.__jsc_ep, globalThis.__jsc_ph,"
+      "   globalThis.__jsc_dres, globalThis.__jsc_drej)");
+    JSEvaluateScript(env->context, connect_code, NULL, NULL, 0, NULL);
+    JSStringRelease(connect_code);
+
+    // Clean up temp globals (captured by IIFE closure above)
+    JSStringRef del_ep = JSStringCreateWithUTF8CString("__jsc_ep");
+    JSObjectDeleteProperty(env->context, global, del_ep, NULL);
+    JSStringRelease(del_ep);
+    JSStringRef del_dr = JSStringCreateWithUTF8CString("__jsc_dres");
+    JSObjectDeleteProperty(env->context, global, del_dr, NULL);
+    JSStringRelease(del_dr);
+    JSStringRef del_dj = JSStringCreateWithUTF8CString("__jsc_drej");
+    JSObjectDeleteProperty(env->context, global, del_dj, NULL);
+    JSStringRelease(del_dj);
+    JSStringRef del_ph = JSStringCreateWithUTF8CString("__jsc_ph");
+    JSObjectDeleteProperty(env->context, global, del_ph, NULL);
+    JSStringRelease(del_ph);
+
     JSObjectSetPrivateProperty(env->context, tracked, ps_key,
                                JSValueMakeNumber(env->context, 0));
+
+    js__nslog("js_run_module: evaluation pending — placeholder namespace + promise chain installed");
   }
 
   JSStringRelease(ps_key);
