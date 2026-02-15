@@ -570,6 +570,33 @@ js__extract_import_specifiers(const char *src, char ***out_specs, size_t *out_co
   size_t len = strlen(src);
 
   for (size_t i = 0; i < len;) {
+    // Skip string literals — these can contain 'from' or 'import' patterns
+    // that are NOT real ESM imports. Critical for minified code.
+    if (src[i] == '\'' || src[i] == '"' || src[i] == '`') {
+      char q = src[i++];
+      while (i < len) {
+        if (src[i] == '\\') { i += 2; continue; }
+        if (src[i] == q) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+
+    // Skip single-line comments
+    if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') {
+      i += 2;
+      while (i < len && src[i] != '\n') i++;
+      continue;
+    }
+
+    // Skip multi-line comments
+    if (src[i] == '/' && i + 1 < len && src[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < len && !(src[i] == '*' && src[i + 1] == '/')) i++;
+      if (i + 1 < len) i += 2;
+      continue;
+    }
+
     // Match 'from' keyword: from 'spec' or from "spec"
     if (i + 4 < len &&
         (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
@@ -679,6 +706,56 @@ js__rewrite_bare_specifiers(const char *src,
 
   for (size_t i = 0; i < src_len;) {
     bool replaced = false;
+
+    // Skip string literals — copy verbatim without matching from/import inside
+    if (src[i] == '\'' || src[i] == '"' || src[i] == '`') {
+      char q = src[i];
+      // Ensure capacity for the string (worst case: rest of source)
+      while (out_pos + (src_len - i) + 1 >= out_cap) {
+        out_cap *= 2;
+        out = realloc(out, out_cap);
+      }
+      out[out_pos++] = src[i++]; // opening quote
+      while (i < src_len) {
+        if (src[i] == '\\') {
+          out[out_pos++] = src[i++];
+          if (i < src_len) out[out_pos++] = src[i++];
+          continue;
+        }
+        if (src[i] == q) {
+          out[out_pos++] = src[i++]; // closing quote
+          break;
+        }
+        out[out_pos++] = src[i++];
+      }
+      continue;
+    }
+
+    // Skip single-line comments — copy verbatim
+    if (src[i] == '/' && i + 1 < src_len && src[i + 1] == '/') {
+      while (i < src_len && src[i] != '\n') {
+        if (out_pos >= out_cap - 1) { out_cap *= 2; out = realloc(out, out_cap); }
+        out[out_pos++] = src[i++];
+      }
+      continue;
+    }
+
+    // Skip multi-line comments — copy verbatim
+    if (src[i] == '/' && i + 1 < src_len && src[i + 1] == '*') {
+      if (out_pos + 2 >= out_cap) { out_cap *= 2; out = realloc(out, out_cap); }
+      out[out_pos++] = src[i++];
+      out[out_pos++] = src[i++];
+      while (i + 1 < src_len && !(src[i] == '*' && src[i + 1] == '/')) {
+        if (out_pos >= out_cap - 1) { out_cap *= 2; out = realloc(out, out_cap); }
+        out[out_pos++] = src[i++];
+      }
+      if (i + 1 < src_len) {
+        if (out_pos + 2 >= out_cap) { out_cap *= 2; out = realloc(out, out_cap); }
+        out[out_pos++] = src[i++];
+        out[out_pos++] = src[i++];
+      }
+      continue;
+    }
 
     // Check for 'from' keyword followed by quote
     if (i + 4 < src_len &&
