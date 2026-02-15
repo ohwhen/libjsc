@@ -71,8 +71,7 @@ struct js_module_s {
   char *source;
   int offset;
 
-  void *jsc_script; // Retained JSScript* (created during instantiate)
-
+  void *jsc_script;
   bool is_synthetic;
 
   struct {
@@ -84,12 +83,9 @@ struct js_module_s {
     void *evaluate_data;
   } callbacks;
 
-  // Synthetic module storage
   size_t export_names_len;
   char **export_names_strs;
-  JSObjectRef pending_exports; // Plain object holding export name→value pairs
-
-  // Cached module namespace, captured during js_run_module via import()
+  JSObjectRef pending_exports;
   JSValueRef namespace_ref;
 };
 
@@ -104,17 +100,11 @@ struct js_env_s {
   uint32_t refs;
   uint32_t depth;
 
-  void *objc_context;         // Retained JSContext* (for module loader)
-  void *module_loader_delegate; // Retained JSCModuleDelegate*
+  void *objc_context;
+  void *module_loader_delegate;
   js_module_t *current_loading_module;
-
-  // Tracks recursive instantiation depth. When > 0, js_run_module skips
-  // evaluation (returns resolved promise) because the top-level js_run_module
-  // will handle all deps via provideFetch + evaluateJSScript:.
   uint32_t instantiate_depth;
 
-  // Module evaluation order (DFS post-order: leaves first, root last).
-  // Populated during js_instantiate_module, consumed during js_run_module.
   js_module_t **module_eval_order;
   size_t module_eval_count;
   size_t module_eval_capacity;
@@ -254,16 +244,11 @@ int
 js_create_platform(uv_loop_t *loop, const js_platform_options_t *options, js_platform_t **result) {
   int err;
 
-  // Increase stack limit for deep module graphs (ESM with 600+ modules).
-  // JSC defaults to ~5MB but clamps to the OS thread stack size. On iOS
-  // secondary threads the default is 512KB which is too small for deep
-  // module resolution chains. Setting this higher lets JSC use more of
-  // the available thread stack when the thread is created with a larger
-  // stack (e.g. via pthread_attr_setstacksize or worklet thread config).
+  // Increase JSC stack limit for deep module graphs. Default 5MB is
+  // insufficient on iOS secondary threads (512KB default stack).
   err = uv_os_setenv("JSC_maxPerThreadStackUsage", "67108864");
   assert(err == 0);
 
-  // Reduce reserved zone sizes to leave more usable stack space.
   err = uv_os_setenv("JSC_softReservedZoneSize", "65536");
   assert(err == 0);
 
@@ -406,27 +391,6 @@ static js_value_t *
 js__on_unhandled_rejection(js_env_t *env, js_callback_info_t *info) {
   int err;
 
-  // Log the rejection reason before propagating
-  {
-    size_t argc = 2;
-    js_value_t *argv[2];
-    err = js_get_callback_info(env, info, &argc, argv, NULL, NULL);
-    assert(err == 0);
-
-    // argv[0] = promise, argv[1] = reason
-    JSStringRef reason_str = JSValueToStringCopy(env->context, (JSValueRef) argv[1], NULL);
-    if (reason_str) {
-      char buf[1024];
-      JSStringGetUTF8CString(reason_str, buf, sizeof(buf));
-      JSStringRelease(reason_str);
-      char logbuf[1100];
-      snprintf(logbuf, sizeof(logbuf), "UNHANDLED REJECTION: %s", buf);
-      js__nslog(logbuf);
-    } else {
-      js__nslog("UNHANDLED REJECTION: (could not convert reason to string)");
-    }
-  }
-
   if (env->callbacks.unhandled_rejection) {
     size_t argc = 2;
     js_value_t *argv[2];
@@ -510,10 +474,6 @@ js__propagate_exception(js_env_t *env) {
   return js__error(env);
 }
 
-// -----------------------------------------------------------------------
-// Module struct accessor functions (called from js-modules.m)
-// -----------------------------------------------------------------------
-
 js_module_t *
 js__env_get_current_module(js_env_t *env) {
   return env->current_loading_module;
@@ -582,13 +542,6 @@ js__module_get_pending_exports(js_module_t *module) {
   return module->pending_exports;
 }
 
-// -----------------------------------------------------------------------
-// Import specifier extractor
-// -----------------------------------------------------------------------
-// Extracts static import/export specifiers from ESM source code.
-// Matches: from 'spec', from "spec", import 'spec', import "spec"
-// Skips: import(...) dynamic imports
-
 static int
 js__extract_import_specifiers(const char *src, char ***out_specs, size_t *out_count) {
   size_t cap = 8;
@@ -597,8 +550,6 @@ js__extract_import_specifiers(const char *src, char ***out_specs, size_t *out_co
   size_t len = strlen(src);
 
   for (size_t i = 0; i < len;) {
-    // Skip string literals — these can contain 'from' or 'import' patterns
-    // that are NOT real ESM imports. Critical for minified code.
     if (src[i] == '\'' || src[i] == '"' || src[i] == '`') {
       char q = src[i++];
       while (i < len) {
@@ -609,14 +560,12 @@ js__extract_import_specifiers(const char *src, char ***out_specs, size_t *out_co
       continue;
     }
 
-    // Skip single-line comments
     if (src[i] == '/' && i + 1 < len && src[i + 1] == '/') {
       i += 2;
       while (i < len && src[i] != '\n') i++;
       continue;
     }
 
-    // Skip multi-line comments
     if (src[i] == '/' && i + 1 < len && src[i + 1] == '*') {
       i += 2;
       while (i + 1 < len && !(src[i] == '*' && src[i + 1] == '/')) i++;
@@ -624,7 +573,6 @@ js__extract_import_specifiers(const char *src, char ***out_specs, size_t *out_co
       continue;
     }
 
-    // Match 'from' keyword: from 'spec' or from "spec"
     if (i + 4 < len &&
         (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
         src[i] == 'f' && src[i + 1] == 'r' &&
@@ -655,8 +603,6 @@ js__extract_import_specifiers(const char *src, char ***out_specs, size_t *out_co
       }
     }
 
-    // Match side-effect import: import 'spec' or import "spec"
-    // (but NOT import(...) or import identifier)
     if (i + 6 < len &&
         (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
         src[i] == 'i' && src[i + 1] == 'm' && src[i + 2] == 'p' &&
@@ -666,7 +612,6 @@ js__extract_import_specifiers(const char *src, char ***out_specs, size_t *out_co
       size_t j = i + 6;
       while (j < len && (src[j] == ' ' || src[j] == '\t')) j++;
 
-      // Only match if directly followed by a quote (side-effect import)
       if (j < len && (src[j] == '\'' || src[j] == '"')) {
         char q = src[j++];
         const char *start = src + j;
@@ -704,13 +649,6 @@ js__free_import_specifiers(char **specs, size_t count) {
   free(specs);
 }
 
-// -----------------------------------------------------------------------
-// Bare specifier rewriter
-// -----------------------------------------------------------------------
-// Rewrites bare import specifiers (those not starting with './', '../', '/')
-// to their resolved URLs. JSC's module loader rejects bare specifiers.
-// Takes a list of (original_spec, replacement_url) pairs.
-
 static char *
 js__rewrite_bare_specifiers(const char *src,
                             const char **orig_specs, const char **repl_urls,
@@ -719,7 +657,6 @@ js__rewrite_bare_specifiers(const char *src,
 
   size_t src_len = strlen(src);
 
-  // Estimate output size (generous)
   size_t extra = 0;
   for (size_t i = 0; i < num_rewrites; i++) {
     size_t orig_len = strlen(orig_specs[i]);
@@ -734,15 +671,14 @@ js__rewrite_bare_specifiers(const char *src,
   for (size_t i = 0; i < src_len;) {
     bool replaced = false;
 
-    // Skip string literals — copy verbatim without matching from/import inside
+    // Skip string literals
     if (src[i] == '\'' || src[i] == '"' || src[i] == '`') {
       char q = src[i];
-      // Ensure capacity for the string (worst case: rest of source)
       while (out_pos + (src_len - i) + 1 >= out_cap) {
         out_cap *= 2;
         out = realloc(out, out_cap);
       }
-      out[out_pos++] = src[i++]; // opening quote
+      out[out_pos++] = src[i++];
       while (i < src_len) {
         if (src[i] == '\\') {
           out[out_pos++] = src[i++];
@@ -750,7 +686,7 @@ js__rewrite_bare_specifiers(const char *src,
           continue;
         }
         if (src[i] == q) {
-          out[out_pos++] = src[i++]; // closing quote
+          out[out_pos++] = src[i++];
           break;
         }
         out[out_pos++] = src[i++];
@@ -758,7 +694,7 @@ js__rewrite_bare_specifiers(const char *src,
       continue;
     }
 
-    // Skip single-line comments — copy verbatim
+    // Skip comments
     if (src[i] == '/' && i + 1 < src_len && src[i + 1] == '/') {
       while (i < src_len && src[i] != '\n') {
         if (out_pos >= out_cap - 1) { out_cap *= 2; out = realloc(out, out_cap); }
@@ -767,7 +703,6 @@ js__rewrite_bare_specifiers(const char *src,
       continue;
     }
 
-    // Skip multi-line comments — copy verbatim
     if (src[i] == '/' && i + 1 < src_len && src[i + 1] == '*') {
       if (out_pos + 2 >= out_cap) { out_cap *= 2; out = realloc(out, out_cap); }
       out[out_pos++] = src[i++];
@@ -784,7 +719,6 @@ js__rewrite_bare_specifiers(const char *src,
       continue;
     }
 
-    // Check for 'from' keyword followed by quote
     if (i + 4 < src_len &&
         (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
         src[i] == 'f' && src[i + 1] == 'r' &&
@@ -802,12 +736,10 @@ js__rewrite_bare_specifiers(const char *src,
         if (k < src_len) {
           size_t spec_len = k - spec_start;
 
-          // Check if this specifier needs rewriting
           for (size_t r = 0; r < num_rewrites; r++) {
             size_t orig_len = strlen(orig_specs[r]);
             if (spec_len == orig_len &&
                 memcmp(src + spec_start, orig_specs[r], orig_len) == 0) {
-              // Copy everything up to the specifier start (including quote)
               size_t pre_len = spec_start - i;
               while (out_pos + pre_len + strlen(repl_urls[r]) + 2 >= out_cap) {
                 out_cap *= 2;
@@ -815,11 +747,9 @@ js__rewrite_bare_specifiers(const char *src,
               }
               memcpy(out + out_pos, src + i, pre_len);
               out_pos += pre_len;
-              // Write replacement
               size_t repl_len = strlen(repl_urls[r]);
               memcpy(out + out_pos, repl_urls[r], repl_len);
               out_pos += repl_len;
-              // Write closing quote and advance
               out[out_pos++] = q;
               i = k + 1;
               replaced = true;
@@ -830,7 +760,6 @@ js__rewrite_bare_specifiers(const char *src,
       }
     }
 
-    // Also check for side-effect import: import 'spec'
     if (!replaced && i + 6 < src_len &&
         (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
         src[i] == 'i' && src[i + 1] == 'm' && src[i + 2] == 'p' &&
@@ -885,16 +814,8 @@ js__rewrite_bare_specifiers(const char *src,
   return out;
 }
 
-// -----------------------------------------------------------------------
-// URL resolution for module specifiers
-// -----------------------------------------------------------------------
-// Resolves a specifier relative to a base URL.
-// e.g., resolve("bar.js", "file:///bare-modules/test.js")
-//     -> "file:///bare-modules/bar.js"
-
 static char *
 js__resolve_module_url(const char *specifier, const char *base_url) {
-  // If specifier already has a scheme, return as-is with prefix
   if (strstr(specifier, "://")) {
     size_t plen = strlen("file:///bare-modules/");
     size_t slen = strlen(specifier);
@@ -905,27 +826,18 @@ js__resolve_module_url(const char *specifier, const char *base_url) {
     return result;
   }
 
-  // Find the last '/' in base_url to get the directory
   const char *last_slash = strrchr(base_url, '/');
-  if (!last_slash) {
-    // Shouldn't happen for well-formed URLs
-    return strdup(base_url);
-  }
+  if (!last_slash) return strdup(base_url);
 
-  size_t dir_len = last_slash - base_url + 1; // include trailing '/'
+  size_t dir_len = last_slash - base_url + 1;
 
-  // Handle "./" prefix — strip it
   const char *spec = specifier;
-  if (spec[0] == '.' && spec[1] == '/') {
-    spec += 2;
-  }
+  if (spec[0] == '.' && spec[1] == '/') spec += 2;
 
-  // Handle "../" — go up one directory per occurrence
   while (spec[0] == '.' && spec[1] == '.' && spec[2] == '/') {
     spec += 3;
-    // Move dir_len back one directory
     if (dir_len > 1) {
-      dir_len--; // back past trailing '/'
+      dir_len--;
       while (dir_len > 0 && base_url[dir_len - 1] != '/') dir_len--;
     }
   }
@@ -988,15 +900,11 @@ js_create_env(uv_loop_t *loop, js_platform_t *platform, const js_env_options_t *
   JSContextGroupRef group;
   JSGlobalContextRef context;
 
-  // Increase JSC's per-thread stack usage limit BEFORE creating any JSContext.
-  // Default is ~5MB which allows only ~50 levels of recursive module loading.
-  // The worklet thread has a 64MB stack; tell JSC to use all of it.
-  // On iOS simulator (debug builds), JSC reads JSC_ env vars during
-  // Options::initialize() which runs on first VM creation.
+  // Increase JSC stack limit before creating any context. Default ~5MB is
+  // insufficient for recursive module loading.
   setenv("JSC_maxPerThreadStackUsage", "67108864", 1);
 
-  // Create JSContext via Obj-C API. This produces a JSAPIGlobalObject which
-  // is required for the module loader delegate to function.
+  // Obj-C API creates JSAPIGlobalObject, required for module loader delegate.
   void *objc_context = js__objc_context_create(&context, &group);
 
   js_env_t *env = malloc(sizeof(js_env_t));
@@ -1292,7 +1200,6 @@ js_get_bindings(js_env_t *env, js_value_t **result) {
 
 int
 js_run_script(js_env_t *env, const char *file, size_t len, int offset, js_value_t *source, js_value_t **result) {
-  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf), "js_run_script: file='%s'", file ? file : "(null)"); js__nslog(logbuf); }
   if (env->exception) return js__error(env);
 
   JSValueRef exception = NULL;
@@ -1325,11 +1232,17 @@ js_run_script(js_env_t *env, const char *file, size_t len, int offset, js_value_
   return 0;
 }
 
+static inline void
+js__delete_global(JSGlobalContextRef ctx, JSObjectRef global, const char *name) {
+  JSStringRef key = JSStringCreateWithUTF8CString(name);
+  JSObjectDeleteProperty(ctx, global, key, NULL);
+  JSStringRelease(key);
+}
+
 int
 js_create_module(js_env_t *env, const char *name, size_t len, int offset, js_value_t *source, js_module_meta_cb cb, void *data, js_module_t **result) {
   if (env->exception) return js__error(env);
 
-  // Extract UTF-8 source string
   JSValueRef exception = NULL;
   JSStringRef src_ref = JSValueToStringCopy(env->context, (JSValueRef) source, &exception);
   if (exception) {
@@ -1342,7 +1255,6 @@ js_create_module(js_env_t *env, const char *name, size_t len, int offset, js_val
   JSStringGetUTF8CString(src_ref, src_buf, max_len);
   JSStringRelease(src_ref);
 
-  // Allocate module
   js_module_t *module = calloc(1, sizeof(js_module_t));
 
   if (len == (size_t) -1) len = strlen(name);
@@ -1353,20 +1265,8 @@ js_create_module(js_env_t *env, const char *name, size_t len, int offset, js_val
 
   module->source = src_buf;
   module->offset = offset;
-  module->is_synthetic = false;
-  module->jsc_script = NULL;
-  module->pending_exports = NULL;
-  module->namespace_ref = NULL;
-
   module->callbacks.meta = cb;
   module->callbacks.meta_data = data;
-  module->callbacks.resolve = NULL;
-  module->callbacks.resolve_data = NULL;
-  module->callbacks.evaluate = NULL;
-  module->callbacks.evaluate_data = NULL;
-
-  module->export_names_len = 0;
-  module->export_names_strs = NULL;
 
   *result = module;
   return 0;
@@ -1385,29 +1285,15 @@ js_create_synthetic_module(js_env_t *env, const char *name, size_t len, js_value
   module->name_len = len;
 
   module->is_synthetic = true;
-  module->jsc_script = NULL;
-  module->namespace_ref = NULL;
-
   module->callbacks.evaluate = cb;
   module->callbacks.evaluate_data = data;
-  module->callbacks.resolve = NULL;
-  module->callbacks.resolve_data = NULL;
-  module->callbacks.meta = NULL;
-  module->callbacks.meta_data = NULL;
 
-  // Create pending exports object
   module->pending_exports = JSObjectMake(env->context, NULL, NULL);
   JSValueProtect(env->context, module->pending_exports);
 
-  // Store export name strings
   module->export_names_len = names_len;
   module->export_names_strs = malloc(names_len * sizeof(char *));
 
-  // Build generated ESM source
-  // Format: var __s = globalThis.__jsc_syn["<name>"];
-  //         export var <name1> = __s["<name1>"];
-  //         export var <name2> = __s["<name2>"];
-  // For "default" export: export default __s["default"];
   size_t src_cap = 256 + names_len * 128;
   char *src = malloc(src_cap);
   int pos = snprintf(src, src_cap,
@@ -1445,16 +1331,9 @@ js_delete_module(js_env_t *env, js_module_t *module) {
   if (module->source) free(module->source);
   if (module->name) free(module->name);
 
-  if (module->jsc_script) {
-    js__module_script_release(module->jsc_script);
-  }
+  if (module->jsc_script) js__module_script_release(module->jsc_script);
 
-  // Guard: during VM teardown (lastChanceToFinalize), the GC sweeps
-  // callback objects which triggers js__on_external_finalize → js_delete_module.
-  // By this point the JSContext/JSGlobalContext may already be destroyed.
-  // Calling JSValueUnprotect on a dead context causes EXC_BAD_ACCESS.
-  // Check both env->context and env->destroying to be safe.
-  if (env->context != NULL && !env->destroying) {
+  if (env->context && !env->destroying) {
     if (module->pending_exports) {
       JSValueUnprotect(env->context, module->pending_exports);
     }
@@ -1485,15 +1364,13 @@ int
 js_get_module_namespace(js_env_t *env, js_module_t *module, js_value_t **result) {
   if (env->exception) return js__error(env);
 
-  // The namespace was captured during js_run_module via import().then(ns => ...).
-  if (module->namespace_ref != NULL) {
+  if (module->namespace_ref) {
     *result = (js_value_t *) module->namespace_ref;
     js__attach_to_handle_scope(env, env->scope, module->namespace_ref);
     return 0;
   }
 
-  // Fallback: for synthetic modules, use the pending_exports object as namespace
-  if (module->is_synthetic && module->pending_exports != NULL) {
+  if (module->is_synthetic && module->pending_exports) {
     *result = (js_value_t *) module->pending_exports;
     js__attach_to_handle_scope(env, env->scope, (JSValueRef) module->pending_exports);
     return 0;
@@ -1509,12 +1386,11 @@ js_set_module_export(js_env_t *env, js_module_t *module, js_value_t *name, js_va
   if (env->exception) return js__error(env);
 
   if (!module->is_synthetic || !module->pending_exports) {
-    int err = js_throw_error(env, NULL, "js_set_module_export: not a synthetic module");
+    int err = js_throw_error(env, NULL, "Not a synthetic module");
     assert(err == 0);
     return js__error(env);
   }
 
-  // Get the name as a JSString
   JSValueRef exception = NULL;
   JSStringRef name_ref = JSValueToStringCopy(env->context, (JSValueRef) name, &exception);
   if (exception) {
@@ -1522,7 +1398,6 @@ js_set_module_export(js_env_t *env, js_module_t *module, js_value_t *name, js_va
     return js__error(env);
   }
 
-  // Set the property on the pending exports object
   JSObjectSetProperty(env->context, module->pending_exports, name_ref,
                       (JSValueRef) value, 0, &exception);
   JSStringRelease(name_ref);
@@ -1535,51 +1410,28 @@ js_set_module_export(js_env_t *env, js_module_t *module, js_value_t *name, js_va
   return 0;
 }
 
-// Internal: instantiate a module and recursively pre-resolve its dependencies.
-// `base_url` is the URL to use for this module's JSScript sourceURL and
-// registry registration. It may differ from file:///bare-modules/<name>
-// when the module was resolved from a parent's import.
 static int
 js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
                               js_module_resolve_cb cb, void *data,
                               const char *base_url) {
-  static int c_depth = 0;
-  c_depth++;
-  if (c_depth == 1 || c_depth % 100 == 0) {
-    char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
-      "js__instantiate_module_at_url: c_depth=%d name='%.80s'",
-      c_depth, module->name ? module->name : "(null)");
-    js__nslog(logbuf);
-  }
-
-  if (env->exception) { c_depth--; return js__error(env); }
+  if (env->exception) return js__error(env);
 
   module->callbacks.resolve = cb;
   module->callbacks.resolve_data = data;
 
-  // Register in delegate EARLY to prevent infinite recursion from cyclic imports.
-  // Without this, module A importing B which imports A would recurse infinitely
-  // because the dedup check (js__module_delegate_lookup) wouldn't find A — it
-  // was only registered AFTER its subtree was fully processed.
-  // The JSScript is NULL at this point; it gets set below after source rewriting.
-  // The delegate only uses JSScript during evaluateJSScript: (in js_run_module),
-  // not during the dedup check here in instantiation.
+  // Register early to prevent infinite recursion from cyclic imports
   js__module_delegate_register(env->module_loader_delegate, base_url, module);
 
-  // For synthetic modules: call the evaluate callback now to populate exports.
-  // This must happen before JSC tries to evaluate the module.
   if (module->is_synthetic && module->callbacks.evaluate) {
     module->callbacks.evaluate(env, module, module->callbacks.evaluate_data);
   }
 
-  // If no resolve callback or no source, create JSScript and return
   if (cb == NULL || module->source == NULL) {
-    if (module->jsc_script == NULL && module->source != NULL) {
+    if (module->jsc_script == NULL && module->source) {
       module->jsc_script = js__module_script_create(
         env->objc_context, module->source, base_url);
     }
 
-    // Track in eval order
     if (env->module_eval_count >= env->module_eval_capacity) {
       env->module_eval_capacity = env->module_eval_capacity ? env->module_eval_capacity * 2 : 64;
       env->module_eval_order = realloc(env->module_eval_order,
@@ -1587,33 +1439,25 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
     }
     env->module_eval_order[env->module_eval_count++] = module;
 
-    c_depth--;
     return 0;
   }
 
-  // Extract import specifiers from the source
   char **specifiers;
   size_t spec_count;
   js__extract_import_specifiers(module->source, &specifiers, &spec_count);
 
-  // Collect bare specifier rewrites and resolve each dependency.
-  // Bare specifiers (not starting with './', '../', '/') must be rewritten
-  // to full URLs because JSC rejects them during module evaluation.
   const char **bare_specs = NULL;
   const char **bare_urls = NULL;
   size_t bare_count = 0;
 
   for (size_t i = 0; i < spec_count; i++) {
-    // Compute the URL that JSC will resolve this specifier to
     char *child_url = js__resolve_module_url(specifiers[i], base_url);
 
-    // Check if this is a bare specifier (needs rewriting)
     bool is_bare = (specifiers[i][0] != '.' && specifiers[i][0] != '/');
     if (specifiers[i][0] == '.' && specifiers[i][1] == '/') is_bare = false;
     if (specifiers[i][0] == '.' && specifiers[i][1] == '.' && specifiers[i][2] == '/') is_bare = false;
 
-    // Skip if already registered (prevents cycles and duplicates)
-    if (js__module_delegate_lookup(env->module_loader_delegate, child_url) != NULL) {
+    if (js__module_delegate_lookup(env->module_loader_delegate, child_url)) {
       if (is_bare) {
         if (bare_specs == NULL) {
           bare_specs = malloc(spec_count * sizeof(char *));
@@ -1628,14 +1472,12 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
       continue;
     }
 
-    // Create JSValueRef for the specifier to pass to the resolve callback
     JSStringRef spec_ref = JSStringCreateWithUTF8CString(specifiers[i]);
     JSValueRef spec_val = JSValueMakeString(env->context, spec_ref);
     JSStringRelease(spec_ref);
 
     JSValueRef assertions = JSValueMakeUndefined(env->context);
 
-    // Call the resolve callback — this creates the child module
     js_module_t *child = cb(
       env,
       (js_value_t *) spec_val,
@@ -1645,31 +1487,26 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
     );
 
     if (child == NULL) {
-      if (is_bare) free(child_url);
-      else free(child_url);
+      free(child_url);
       if (env->exception) {
         js__free_import_specifiers(specifiers, spec_count);
         for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
         free(bare_specs); free(bare_urls);
-        c_depth--;
         return js__error(env);
       }
       continue;
     }
 
-    // Record bare specifier mapping before recursing (child_url may be needed)
     if (is_bare) {
       if (bare_specs == NULL) {
         bare_specs = malloc(spec_count * sizeof(char *));
         bare_urls = malloc(spec_count * sizeof(char *));
       }
-      // Duplicate child_url since we also pass it to recursive call
       bare_specs[bare_count] = specifiers[i];
       bare_urls[bare_count] = strdup(child_url);
       bare_count++;
     }
 
-    // Recursively instantiate the child at the resolved URL
     int err = js__instantiate_module_at_url(env, child, cb, data, child_url);
     free(child_url);
 
@@ -1677,12 +1514,10 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
       js__free_import_specifiers(specifiers, spec_count);
       for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
       free(bare_specs); free(bare_urls);
-      c_depth--;
       return err;
     }
   }
 
-  // Rewrite bare specifiers in the source if any were found
   const char *final_source = module->source;
   char *rewritten = NULL;
 
@@ -1694,7 +1529,6 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
     }
   }
 
-  // Now create JSScript from the (possibly rewritten) source
   if (module->jsc_script == NULL) {
     module->jsc_script = js__module_script_create(
       env->objc_context, final_source, base_url);
@@ -1706,16 +1540,12 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
       js__free_import_specifiers(specifiers, spec_count);
       for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
       free(bare_specs); free(bare_urls);
-      c_depth--;
       return js__error(env);
     }
   }
 
   if (rewritten) free(rewritten);
 
-  // Track in DFS post-order for topological pre-evaluation.
-  // Children were already added by recursive calls above, so this module
-  // appears after all its dependencies — enabling bottom-up evaluation.
   if (env->module_eval_count >= env->module_eval_capacity) {
     env->module_eval_capacity = env->module_eval_capacity ? env->module_eval_capacity * 2 : 64;
     env->module_eval_order = realloc(env->module_eval_order,
@@ -1727,7 +1557,6 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
   for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
   free(bare_specs);
   free(bare_urls);
-  c_depth--;
   return 0;
 }
 
@@ -1737,29 +1566,13 @@ js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb c
 
   env->instantiate_depth++;
 
-  // When called recursively from _onimport → Module.load() → binding.runModule()
-  // during another module's instantiation, skip the actual work. The parent's
-  // js__instantiate_module_at_url will handle dependency resolution in C code
-  // (no JS stack growth). This prevents the JS-side recursive chain:
-  //   _onimport → Module.load → binding.runModule → js_instantiate_module → callback → _onimport → ...
-  // Without this guard, 200+ level deep dependency chains overflow the JS stack.
+  // Skip when called recursively from JS (depth > 1). The top-level
+  // instantiation handles all dependencies via C-level recursion.
   if (env->instantiate_depth > 1) {
-    { static int skip_count = 0; skip_count++;
-      if (skip_count <= 5 || skip_count % 100 == 0) {
-        char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
-          "js_instantiate_module: GUARD SKIP #%d (depth=%u, env=%p, name='%.80s')",
-          skip_count, env->instantiate_depth, (void*)env,
-          module->name ? module->name : "(null)");
-        js__nslog(logbuf);
-      }
-    }
     env->instantiate_depth--;
     return 0;
   }
 
-  size_t count_before = env->module_eval_count;
-
-  // Compute the base URL for this module
   char url[2048];
   snprintf(url, sizeof(url), "file:///bare-modules/%s", module->name);
 
@@ -1767,100 +1580,47 @@ js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb c
 
   env->instantiate_depth--;
 
-  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf),
-    "js_instantiate_module: name='%s' cb=%p eval_count: %zu -> %zu (result=%d) depth=%u",
-    module->name ? module->name : "(null)", (void*)cb,
-    count_before, env->module_eval_count, result, env->instantiate_depth);
-    js__nslog(logbuf); }
-
   return result;
 }
 
 int
 js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
-  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf),
-    "js_run_module: name='%s' instantiate_depth=%u jsc_script=%p",
-    module->name ? module->name : "(null)", env->instantiate_depth,
-    module->jsc_script);
-    js__nslog(logbuf); }
-  if (env->exception) {
-    js__nslog("js_run_module: ERROR env->exception already set on entry!");
-    return js__error(env);
-  }
+  if (env->exception) return js__error(env);
 
-  // When called recursively from _onimport → Module.load() → binding.runModule()
-  // during another module's instantiation, skip evaluation. The top-level
-  // js_run_module (instantiate_depth == 0) will handle all deps via
-  // provideFetch + evaluateJSScript:. Returning a resolved promise satisfies
-  // binding.runModule()'s promise state check.
+  // Skip when called recursively — return a resolved promise
   if (env->instantiate_depth > 0) {
     JSStringRef code = JSStringCreateWithUTF8CString("Promise.resolve(undefined)");
     JSValueRef promise = JSEvaluateScript(env->context, code, NULL, NULL, 0, NULL);
     JSStringRelease(code);
     *result = (js_value_t *) promise;
-    { char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
-      "js_run_module: SKIPPED (recursive, depth=%u) — returning resolved promise",
-      env->instantiate_depth);
-      js__nslog(logbuf); }
     return 0;
   }
 
   if (module->jsc_script == NULL) {
-    { char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
-      "js_run_module: ERROR jsc_script==NULL for '%s'",
-      module->name ? module->name : "(null)");
-      js__nslog(logbuf); }
     int err = js_throw_error(env, NULL, "Module not instantiated");
     assert(err == 0);
     return js__error(env);
   }
 
-  // Note: synthetic module exports are already set up during
-  // js_instantiate_module (evaluate callback called there) and
-  // the delegate handles setting globalThis.__jsc_syn before JSC
-  // evaluates the synthetic source.
-
-  // --- Direct provideFetch + individual evaluation ---
-  // Strategy to prevent JSC's recursive module evaluate() from overflowing:
-  //
-  // 1. Pre-register ALL dependency sources via JSModuleLoader::provideFetch().
-  //    This bypasses the delegate entirely (no recursive delegate callbacks).
-  //
-  // 2. Call evaluateJSScript: on EACH dependency individually, in topological
-  //    order (leaf deps first, from module_eval_order which is DFS post-order).
-  //    Each call creates an independent module record in JSC's internal registry.
-  //
-  // 3. When microtasks eventually drain (after the JS call stack unwinds):
-  //    - Leaf modules evaluate first (FIFO microtask queue)
-  //    - Parent modules find their deps already evaluated → skip recursion
-  //    - Each module evaluates at depth 1 (constant stack)
-  //
-  // Without step 2, calling evaluateJSScript: only on the root creates ONE
-  // pipeline that processes the entire dependency tree recursively during
-  // microtask drain. With 374 modules, this overflows the JS stack.
-
+  // Pre-register dependencies via provideFetch for constant stack depth
   if (env->module_eval_count > 0) {
-    char logbuf[128];
-    snprintf(logbuf, sizeof(logbuf),
-      "js_run_module: provideFetch pre-registering %zu deps",
-      env->module_eval_count);
-    js__nslog(logbuf);
+    bool has_cycle = false;
+    for (size_t i = 0; i < env->module_eval_count; i++) {
+      if (env->module_eval_order[i] == module) { has_cycle = true; break; }
+    }
 
-    // Collect scripts and URLs for all dependencies (NOT the root)
     void **dep_scripts = malloc(env->module_eval_count * sizeof(void *));
     const char **dep_urls = malloc(env->module_eval_count * sizeof(char *));
     char **url_bufs = malloc(env->module_eval_count * sizeof(char *));
     size_t dep_count = 0;
 
-    for (size_t i = 0; i < env->module_eval_count; i++) {
+    for (size_t i = 0; !has_cycle && i < env->module_eval_count; i++) {
       js_module_t *dep = env->module_eval_order[i];
-      if (dep == module) continue;      // skip root
-      if (dep->jsc_script == NULL) continue;
+      if (dep == module || dep->jsc_script == NULL) continue;
 
-      const char *name = js__module_get_name(dep);
-      size_t url_len = strlen("file:///bare-modules/") + strlen(name) + 1;
+      size_t url_len = strlen("file:///bare-modules/") + strlen(dep->name) + 1;
       char *url = malloc(url_len);
-      snprintf(url, url_len, "file:///bare-modules/%s", name);
+      snprintf(url, url_len, "file:///bare-modules/%s", dep->name);
 
       dep_scripts[dep_count] = dep->jsc_script;
       dep_urls[dep_count] = url;
@@ -1868,21 +1628,15 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
       dep_count++;
     }
 
-    // Pre-register all dependency sources in JSC's fetch map
-    js__provide_fetch_modules(
-      env->objc_context, dep_scripts, dep_urls, dep_count);
+    js__provide_fetch_modules(env->objc_context, dep_scripts, dep_urls, dep_count);
 
-    // Free URL buffers
     for (size_t i = 0; i < dep_count; i++) free(url_bufs[i]);
     free(dep_scripts);
     free(dep_urls);
     free(url_bufs);
     env->module_eval_count = 0;
-
-    js__nslog("js_run_module: provideFetch complete, evaluating root");
   }
 
-  // Evaluate the root module — all deps already have module records
   env->depth++;
   JSValueRef eval_result = js__module_script_evaluate(
     env->objc_context, module->jsc_script);
@@ -1890,46 +1644,14 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
 
   JSObjectRef global = JSContextGetGlobalObject(env->context);
 
-  // Log what evaluateJSScript returned
-  {
-    const char *type = "unknown";
-    if (eval_result == NULL) type = "NULL";
-    else if (JSValueIsUndefined(env->context, eval_result)) type = "undefined";
-    else if (JSValueIsNull(env->context, eval_result)) type = "null";
-    else if (JSValueIsBoolean(env->context, eval_result)) type = "boolean";
-    else if (JSValueIsNumber(env->context, eval_result)) type = "number";
-    else if (JSValueIsString(env->context, eval_result)) type = "string";
-    else if (JSValueIsObject(env->context, eval_result)) type = "object";
-    char logbuf[256];
-    snprintf(logbuf, sizeof(logbuf), "js_run_module: evaluateJSScript returned type=%s", type);
-    js__nslog(logbuf);
-  }
-
   if (eval_result == NULL) {
-    { char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
-      "js_run_module: ERROR evaluateJSScript returned NULL for '%s' (exception=%d)",
-      module->name ? module->name : "(null)", env->exception != NULL);
-      js__nslog(logbuf); }
-    if (env->exception) {
-      // Log the exception message
-      JSStringRef exc_str = JSValueToStringCopy(env->context, env->exception, NULL);
-      if (exc_str) {
-        char exc_buf[512];
-        JSStringGetUTF8CString(exc_str, exc_buf, sizeof(exc_buf));
-        JSStringRelease(exc_str);
-        { char logbuf2[768]; snprintf(logbuf2, sizeof(logbuf2),
-          "js_run_module: exception='%.500s'", exc_buf);
-          js__nslog(logbuf2); }
-      }
-      return js__propagate_exception(env);
-    }
+    if (env->exception) return js__propagate_exception(env);
 
     int err = js_throw_error(env, NULL, "Module evaluation returned NULL");
     assert(err == 0);
     return js__error(env);
   }
 
-  // Check if the result is a promise by looking for .then
   bool is_promise = false;
   if (JSValueIsObject(env->context, eval_result)) {
     JSStringRef then_key = JSStringCreateWithUTF8CString("then");
@@ -1939,102 +1661,71 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
     is_promise = !JSValueIsUndefined(env->context, then_val);
   }
 
-  // Check if result looks like a module namespace (has Symbol.toStringTag === 'Module')
   bool is_namespace = false;
   if (JSValueIsObject(env->context, eval_result) && !is_promise) {
     JSStringRef tag_code = JSStringCreateWithUTF8CString(
-      "(function(obj) { return Object.prototype.toString.call(obj) === '[object Module]'; })");
+      "(function(o){return Object.prototype.toString.call(o)==='[object Module]'})");
     JSValueRef tag_fn = JSEvaluateScript(env->context, tag_code, NULL, NULL, 0, NULL);
     JSStringRelease(tag_code);
     if (tag_fn && JSValueIsObject(env->context, tag_fn)) {
       JSValueRef args[] = { eval_result };
-      JSValueRef tag_result = JSObjectCallAsFunction(env->context,
+      JSValueRef r = JSObjectCallAsFunction(env->context,
         (JSObjectRef)tag_fn, NULL, 1, args, NULL);
-      if (tag_result) is_namespace = JSValueToBoolean(env->context, tag_result);
+      if (r) is_namespace = JSValueToBoolean(env->context, r);
     }
   }
 
-  {
-    char logbuf[256];
-    snprintf(logbuf, sizeof(logbuf),
-      "js_run_module: is_promise=%d, is_namespace=%d", is_promise, is_namespace);
-    js__nslog(logbuf);
-  }
-
-  // If evaluateJSScript returned the namespace directly, capture it
   if (is_namespace) {
     module->namespace_ref = eval_result;
     JSValueProtect(env->context, module->namespace_ref);
   }
 
-  // Build the tracked promise
   int state = 0;
   JSValueRef mr_val = JSValueMakeUndefined(env->context);
 
   if (is_promise) {
-    // Track the promise state
-    JSObjectSetProperty(env->context, global,
-      JSStringCreateWithUTF8CString("__jsc_mp"), eval_result, 0, NULL);
+    JSStringRef mp_key = JSStringCreateWithUTF8CString("__jsc_mp");
+    JSObjectSetProperty(env->context, global, mp_key, eval_result, 0, NULL);
+    JSStringRelease(mp_key);
 
     JSStringRef chain_code = JSStringCreateWithUTF8CString(
-      "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined;"
+      "globalThis.__jsc_ms=0;globalThis.__jsc_mr=undefined;"
       "__jsc_mp.then("
-      "  function(v) { globalThis.__jsc_ms = 1; globalThis.__jsc_mr = v; },"
-      "  function(r) { globalThis.__jsc_ms = 2; globalThis.__jsc_mr = r; }"
-      ")");
+      "function(v){globalThis.__jsc_ms=1;globalThis.__jsc_mr=v},"
+      "function(r){globalThis.__jsc_ms=2;globalThis.__jsc_mr=r})");
     JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
     JSStringRelease(chain_code);
 
-    // Drain module resolutions and microtasks. The delegate queues
-    // module resolutions beyond kMaxResolveBatch to prevent stack
-    // overflow. Each drain_one pops one item, resets the batch counter,
-    // and resolves it — which may trigger up to kMaxResolveBatch more
-    // synchronous resolutions before queuing again. drain_run_loop
-    // processes any pending run loop sources JSC needs.
-    //
-    // On iOS (reentrancy guard active), module evaluation is deferred
-    // until the JS call stack unwinds. The drain loop won't resolve
-    // modules here — break early if nothing is happening.
-    int iterations = 0;
+    // Drain delegate queue and microtasks until the promise settles
+    JSStringRef ms_key = JSStringCreateWithUTF8CString("__jsc_ms");
     int idle = 0;
-    for (; iterations < 5000 && state == 0; iterations++) {
+    for (int i = 0; i < 5000 && state == 0; i++) {
       int drained = js__module_delegate_drain_one(env->module_loader_delegate);
       js__drain_run_loop();
-      state = js__objc_eval_int(env->objc_context, "globalThis.__jsc_ms");
+
+      JSValueRef ms_val = JSObjectGetProperty(env->context, global, ms_key, NULL);
+      state = ms_val ? (int) JSValueToNumber(env->context, ms_val, NULL) : 0;
+
       if (!drained && state == 0) {
-        if (++idle >= 10) break;  // Nothing happening, don't wait
+        if (++idle >= 10) break;
       } else {
         idle = 0;
       }
     }
-
-    {
-      char logbuf[128];
-      snprintf(logbuf, sizeof(logbuf), "js_run_module: promise state=%d, iterations=%d", state, iterations);
-      js__nslog(logbuf);
-    }
+    JSStringRelease(ms_key);
 
     JSStringRef mr_key = JSStringCreateWithUTF8CString("__jsc_mr");
     mr_val = JSObjectGetProperty(env->context, global, mr_key, NULL);
     JSStringRelease(mr_key);
 
-    // Clean up promise tracking globals
-    JSStringRef del_mp = JSStringCreateWithUTF8CString("__jsc_mp");
-    JSObjectDeleteProperty(env->context, global, del_mp, NULL);
-    JSStringRelease(del_mp);
-    JSStringRef del_ms = JSStringCreateWithUTF8CString("__jsc_ms");
-    JSObjectDeleteProperty(env->context, global, del_ms, NULL);
-    JSStringRelease(del_ms);
-    JSStringRef del_mr = JSStringCreateWithUTF8CString("__jsc_mr");
-    JSObjectDeleteProperty(env->context, global, del_mr, NULL);
-    JSStringRelease(del_mr);
+    js__delete_global(env->context, global, "__jsc_mp");
+    js__delete_global(env->context, global, "__jsc_ms");
+    js__delete_global(env->context, global, "__jsc_mr");
   } else {
-    // evaluateJSScript completed synchronously (non-promise result)
     state = 1;
     mr_val = eval_result;
   }
 
-  // Create a tracked deferred promise with __ps set
   JSObjectRef resolve_fn, reject_fn;
   JSValueRef exception = NULL;
   JSObjectRef tracked = JSObjectMakeDeferredPromise(
@@ -2055,23 +1746,11 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
                                JSValueMakeNumber(env->context, 2));
     JSObjectSetPrivateProperty(env->context, tracked, pr_key, mr_val);
   } else {
-    // Module evaluation is pending (async — JSC reentrancy guard on iOS).
-    // This happens when js_run_module is called from within a JavaScript
-    // execution context: JSC suppresses microtask draining, so the module
-    // loader's delegate calls are deferred. The evaluateJSScript promise
-    // will resolve later when the JS call stack fully unwinds.
-
-    // 1. Create a placeholder namespace so getNamespace() doesn't crash.
-    //    It will be populated with real exports when the promise resolves.
+    // Evaluation pending — connect eval promise to deferred promise
     JSObjectRef placeholder = JSObjectMake(env->context, NULL, NULL);
     module->namespace_ref = (JSValueRef) placeholder;
     JSValueProtect(env->context, module->namespace_ref);
 
-    // 2. Connect original evaluateJSScript promise → deferred promise.
-    //    When the original resolves (after microtask drain):
-    //    - Copy namespace exports to placeholder object
-    //    - Resolve/reject the deferred promise
-    //    Use an IIFE to capture values before we delete the temp globals.
     JSStringRef ep_key = JSStringCreateWithUTF8CString("__jsc_ep");
     JSObjectSetProperty(env->context, global, ep_key, eval_result, 0, NULL);
     JSStringRelease(ep_key);
@@ -2089,40 +1768,24 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
     JSStringRelease(ph_key);
 
     JSStringRef connect_code = JSStringCreateWithUTF8CString(
-      "(function(ep, ph, dres, drej) {"
-      "  ep.then(function(ns) {"
-      "    if (ns && typeof ns === 'object') {"
-      "      try {"
-      "        Reflect.ownKeys(ns).forEach(function(k) {"
-      "          try { ph[k] = ns[k]; } catch(e) {}"
-      "        });"
-      "      } catch(e) {}"
-      "    }"
-      "    dres(ns);"
-      "  }, drej);"
-      "})(globalThis.__jsc_ep, globalThis.__jsc_ph,"
-      "   globalThis.__jsc_dres, globalThis.__jsc_drej)");
+      "(function(ep,ph,dres,drej){"
+      "ep.then(function(ns){"
+      "if(ns&&typeof ns==='object')try{"
+      "Reflect.ownKeys(ns).forEach(function(k){try{ph[k]=ns[k]}catch(e){}})"
+      "}catch(e){}"
+      "dres(ns)},drej)"
+      "})(globalThis.__jsc_ep,globalThis.__jsc_ph,"
+      "globalThis.__jsc_dres,globalThis.__jsc_drej)");
     JSEvaluateScript(env->context, connect_code, NULL, NULL, 0, NULL);
     JSStringRelease(connect_code);
 
-    // Clean up temp globals (captured by IIFE closure above)
-    JSStringRef del_ep = JSStringCreateWithUTF8CString("__jsc_ep");
-    JSObjectDeleteProperty(env->context, global, del_ep, NULL);
-    JSStringRelease(del_ep);
-    JSStringRef del_dr = JSStringCreateWithUTF8CString("__jsc_dres");
-    JSObjectDeleteProperty(env->context, global, del_dr, NULL);
-    JSStringRelease(del_dr);
-    JSStringRef del_dj = JSStringCreateWithUTF8CString("__jsc_drej");
-    JSObjectDeleteProperty(env->context, global, del_dj, NULL);
-    JSStringRelease(del_dj);
-    JSStringRef del_ph = JSStringCreateWithUTF8CString("__jsc_ph");
-    JSObjectDeleteProperty(env->context, global, del_ph, NULL);
-    JSStringRelease(del_ph);
+    js__delete_global(env->context, global, "__jsc_ep");
+    js__delete_global(env->context, global, "__jsc_dres");
+    js__delete_global(env->context, global, "__jsc_drej");
+    js__delete_global(env->context, global, "__jsc_ph");
 
     JSObjectSetPrivateProperty(env->context, tracked, ps_key,
                                JSValueMakeNumber(env->context, 0));
-
-    js__nslog("js_run_module: evaluation pending — placeholder namespace + promise chain installed");
   }
 
   JSStringRelease(ps_key);
@@ -3159,12 +2822,50 @@ js_create_symbol(js_env_t *env, js_value_t *description, js_value_t **result) {
 
 int
 js_symbol_for(js_env_t *env, const char *description, size_t len, js_value_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_symbol_for");
-  assert(err == 0);
+  JSStringRef symbol_str = JSStringCreateWithUTF8CString("Symbol");
+  JSValueRef symbol_ctor = JSObjectGetProperty(env->context, JSContextGetGlobalObject(env->context), symbol_str, &env->exception);
+  JSStringRelease(symbol_str);
 
-  return js__error(env);
+  if (env->exception) return js__propagate_exception(env);
+
+  JSStringRef for_str = JSStringCreateWithUTF8CString("for");
+  JSValueRef for_fn = JSObjectGetProperty(env->context, (JSObjectRef) symbol_ctor, for_str, &env->exception);
+  JSStringRelease(for_str);
+
+  if (env->exception) return js__propagate_exception(env);
+
+  JSStringRef desc_ref;
+
+  if (len == (size_t) -1) {
+    desc_ref = JSStringCreateWithUTF8CString(description);
+  } else {
+    char *desc_cstr = malloc(len + 1);
+    memcpy(desc_cstr, description, len);
+    desc_cstr[len] = '\0';
+    desc_ref = JSStringCreateWithUTF8CString(desc_cstr);
+    free(desc_cstr);
+  }
+
+  JSValueRef desc_val = JSValueMakeString(env->context, desc_ref);
+  JSStringRelease(desc_ref);
+
+  JSValueRef argv[] = {desc_val};
+
+  env->depth++;
+
+  JSValueRef symbol = JSObjectCallAsFunction(env->context, (JSObjectRef) for_fn, (JSObjectRef) symbol_ctor, 1, argv, &env->exception);
+
+  env->depth--;
+
+  if (env->exception) return js__propagate_exception(env);
+
+  *result = (js_value_t *) symbol;
+
+  js__attach_to_handle_scope(env, env->scope, symbol);
+
+  return 0;
 }
 
 int
@@ -3842,7 +3543,9 @@ js__on_backed_arraybuffer_finalize(void *bytes, void *deallocatorContext) {
   js_arraybuffer_backing_store_t *backing_store = (js_arraybuffer_backing_store_t *) deallocatorContext;
 
   if (--backing_store->references == 0) {
-    JSValueUnprotect(backing_store->env->context, backing_store->owner);
+    if (backing_store->env->context) {
+      JSValueUnprotect(backing_store->env->context, backing_store->owner);
+    }
 
     free(backing_store);
   }
@@ -4112,7 +3815,9 @@ js_release_arraybuffer_backing_store(js_env_t *env, js_arraybuffer_backing_store
   // Allow continuing even with a pending exception
 
   if (--backing_store->references == 0) {
-    JSValueUnprotect(env->context, backing_store->owner);
+    if (env->context) {
+      JSValueUnprotect(env->context, backing_store->owner);
+    }
 
     free(backing_store);
   }
@@ -7046,12 +6751,18 @@ js_request_garbage_collection(js_env_t *env) {
 
 int
 js_get_heap_statistics(js_env_t *env, js_heap_statistics_t *result) {
-  int err;
+  // JSC does not expose detailed heap statistics via its public C API.
+  // Return best-effort values: external_memory is tracked by the env,
+  // total/used heap sizes are unavailable so we report 0.
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_get_heap_statistics");
-  assert(err == 0);
+  result->total_heap_size = 0;
+  result->used_heap_size = 0;
 
-  return js__error(env);
+  if (result->version >= 1) {
+    result->external_memory = env->external_memory;
+  }
+
+  return 0;
 }
 
 int

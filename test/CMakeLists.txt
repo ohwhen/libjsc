@@ -199,14 +199,6 @@ list(APPEND skipped_tests
   get-error-location
 
   # Not implemented
-  call-threadsafe-function-after-release
-  call-threadsafe-function-with-data
-  create-threadsafe-function
-  create-threadsafe-function-with-callback
-  create-threadsafe-function-with-context
-  create-threadsafe-function-with-finalizer
-
-  # Not implemented
   call-function-in-context
   run-script-in-context
 
@@ -234,7 +226,6 @@ list(APPEND skipped_tests
   import-meta
   import-meta-throw
   run-module-async
-  run-module-cyclic-import
   run-module-in-context
 
   # https://bugs.webkit.org/show_bug.cgi?id=250552
