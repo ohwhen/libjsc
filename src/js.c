@@ -1045,6 +1045,8 @@ js_create_module(js_env_t *env, const char *name, size_t len, int offset, js_val
   module->export_names_len = 0;
   module->export_names_strs = NULL;
 
+  NSLog(@"[libjsc] js_create_module: name='%s' source_len=%zu", module->name, strlen(rewritten));
+
   *result = module;
   return 0;
 }
@@ -1195,13 +1197,16 @@ js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb c
 
   // Create the JSScript for this module
   if (module->jsc_script == NULL && module->source != NULL) {
-    char url[512];
+    char url[1024];
     snprintf(url, sizeof(url), "file:///bare-modules/%s", module->name);
+
+    NSLog(@"[libjsc] js_instantiate_module: name='%s' url='%s'", module->name, url);
 
     module->jsc_script = js__module_script_create(
       env->objc_context, module->source, url);
 
     if (module->jsc_script == NULL) {
+      NSLog(@"[libjsc] js_instantiate_module: JSScript creation FAILED for '%s'", module->name);
       int err = js_throw_error(env, NULL, "Failed to create module script");
       assert(err == 0);
       return js__error(env);
@@ -1252,6 +1257,8 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   // Set current module for the delegate
   js_module_t *saved = env->current_loading_module;
   env->current_loading_module = module;
+
+  NSLog(@"[libjsc] js_run_module: name='%s' current_loading_module=%p", module->name, (void *)module);
 
   env->depth++;
 

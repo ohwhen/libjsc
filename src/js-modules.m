@@ -84,11 +84,14 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
 
   js_module_t *current = js__env_get_current_module(env);
 
+  NSLog(@"[libjsc] delegate: identifier='%@' specifier='%@' current=%p", idStr, specifier, (void *)current);
+
   // --- Root module fetch ---
   // If the fetched identifier matches the current module being evaluated,
   // provide its pre-created JSScript.
   if (current != NULL) {
     const char *currentName = js__module_get_name(current);
+    NSLog(@"[libjsc] delegate: checking root match: specifier='%@' vs currentName='%s'", specifier, currentName);
     if (currentName && [specifier isEqualToString:@(currentName)]) {
       void *script = js__module_get_script(current);
       if (script) {
