@@ -651,6 +651,137 @@ js__free_import_specifiers(char **specs, size_t count) {
 }
 
 // -----------------------------------------------------------------------
+// Bare specifier rewriter
+// -----------------------------------------------------------------------
+// Rewrites bare import specifiers (those not starting with './', '../', '/')
+// to their resolved URLs. JSC's module loader rejects bare specifiers.
+// Takes a list of (original_spec, replacement_url) pairs.
+
+static char *
+js__rewrite_bare_specifiers(const char *src,
+                            const char **orig_specs, const char **repl_urls,
+                            size_t num_rewrites) {
+  if (num_rewrites == 0 || src == NULL) return NULL;
+
+  size_t src_len = strlen(src);
+
+  // Estimate output size (generous)
+  size_t extra = 0;
+  for (size_t i = 0; i < num_rewrites; i++) {
+    size_t orig_len = strlen(orig_specs[i]);
+    size_t repl_len = strlen(repl_urls[i]);
+    if (repl_len > orig_len) extra += (repl_len - orig_len) * 4; // up to 4 occurrences
+  }
+
+  size_t out_cap = src_len + extra + 1;
+  char *out = malloc(out_cap);
+  size_t out_pos = 0;
+
+  for (size_t i = 0; i < src_len;) {
+    bool replaced = false;
+
+    // Check for 'from' keyword followed by quote
+    if (i + 4 < src_len &&
+        (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
+        src[i] == 'f' && src[i + 1] == 'r' &&
+        src[i + 2] == 'o' && src[i + 3] == 'm') {
+
+      size_t j = i + 4;
+      while (j < src_len && (src[j] == ' ' || src[j] == '\t')) j++;
+
+      if (j < src_len && (src[j] == '\'' || src[j] == '"')) {
+        char q = src[j];
+        size_t spec_start = j + 1;
+        size_t k = spec_start;
+        while (k < src_len && src[k] != q) k++;
+
+        if (k < src_len) {
+          size_t spec_len = k - spec_start;
+
+          // Check if this specifier needs rewriting
+          for (size_t r = 0; r < num_rewrites; r++) {
+            size_t orig_len = strlen(orig_specs[r]);
+            if (spec_len == orig_len &&
+                memcmp(src + spec_start, orig_specs[r], orig_len) == 0) {
+              // Copy everything up to the specifier start (including quote)
+              size_t pre_len = spec_start - i;
+              while (out_pos + pre_len + strlen(repl_urls[r]) + 2 >= out_cap) {
+                out_cap *= 2;
+                out = realloc(out, out_cap);
+              }
+              memcpy(out + out_pos, src + i, pre_len);
+              out_pos += pre_len;
+              // Write replacement
+              size_t repl_len = strlen(repl_urls[r]);
+              memcpy(out + out_pos, repl_urls[r], repl_len);
+              out_pos += repl_len;
+              // Write closing quote and advance
+              out[out_pos++] = q;
+              i = k + 1;
+              replaced = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Also check for side-effect import: import 'spec'
+    if (!replaced && i + 6 < src_len &&
+        (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
+        src[i] == 'i' && src[i + 1] == 'm' && src[i + 2] == 'p' &&
+        src[i + 3] == 'o' && src[i + 4] == 'r' && src[i + 5] == 't') {
+
+      size_t j = i + 6;
+      while (j < src_len && (src[j] == ' ' || src[j] == '\t')) j++;
+
+      if (j < src_len && (src[j] == '\'' || src[j] == '"')) {
+        char q = src[j];
+        size_t spec_start = j + 1;
+        size_t k = spec_start;
+        while (k < src_len && src[k] != q) k++;
+
+        if (k < src_len) {
+          size_t spec_len = k - spec_start;
+
+          for (size_t r = 0; r < num_rewrites; r++) {
+            size_t orig_len = strlen(orig_specs[r]);
+            if (spec_len == orig_len &&
+                memcmp(src + spec_start, orig_specs[r], orig_len) == 0) {
+              size_t pre_len = spec_start - i;
+              while (out_pos + pre_len + strlen(repl_urls[r]) + 2 >= out_cap) {
+                out_cap *= 2;
+                out = realloc(out, out_cap);
+              }
+              memcpy(out + out_pos, src + i, pre_len);
+              out_pos += pre_len;
+              size_t repl_len = strlen(repl_urls[r]);
+              memcpy(out + out_pos, repl_urls[r], repl_len);
+              out_pos += repl_len;
+              out[out_pos++] = q;
+              i = k + 1;
+              replaced = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!replaced) {
+      if (out_pos >= out_cap - 1) {
+        out_cap *= 2;
+        out = realloc(out, out_cap);
+      }
+      out[out_pos++] = src[i++];
+    }
+  }
+
+  out[out_pos] = '\0';
+  return out;
+}
+
+// -----------------------------------------------------------------------
 // URL resolution for module specifiers
 // -----------------------------------------------------------------------
 // Resolves a specifier relative to a base URL.
@@ -1283,47 +1414,56 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
   module->callbacks.resolve = cb;
   module->callbacks.resolve_data = data;
 
-  // Create JSScript if not already created
-  if (module->jsc_script == NULL && module->source != NULL) {
-    module->jsc_script = js__module_script_create(
-      env->objc_context, module->source, base_url);
-
-    if (module->jsc_script == NULL) {
-      int err = js_throw_error(env, NULL, "Failed to create module script");
-      assert(err == 0);
-      return js__error(env);
-    }
-  }
-
-  // Register in delegate's registry at the base_url
-  js__module_delegate_register(env->module_loader_delegate, base_url, module);
-  { char logbuf[2200]; snprintf(logbuf, sizeof(logbuf), "registered module: url='%s' name='%s'", base_url, module->name); js__nslog(logbuf); }
-
   // For synthetic modules: call the evaluate callback now to populate exports.
   // This must happen before JSC tries to evaluate the module.
   if (module->is_synthetic && module->callbacks.evaluate) {
     module->callbacks.evaluate(env, module, module->callbacks.evaluate_data);
   }
 
-  // If no resolve callback or no source, nothing to pre-resolve
-  if (cb == NULL || module->source == NULL) return 0;
+  // If no resolve callback or no source, create JSScript and register now
+  if (cb == NULL || module->source == NULL) {
+    if (module->jsc_script == NULL && module->source != NULL) {
+      module->jsc_script = js__module_script_create(
+        env->objc_context, module->source, base_url);
+    }
+    js__module_delegate_register(env->module_loader_delegate, base_url, module);
+    return 0;
+  }
 
   // Extract import specifiers from the source
   char **specifiers;
   size_t spec_count;
   js__extract_import_specifiers(module->source, &specifiers, &spec_count);
-  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf), "extracted %zu specifiers from '%s'", spec_count, module->name); js__nslog(logbuf); }
 
-  // Resolve each dependency
+  // Collect bare specifier rewrites and resolve each dependency.
+  // Bare specifiers (not starting with './', '../', '/') must be rewritten
+  // to full URLs because JSC rejects them during module evaluation.
+  const char **bare_specs = NULL;
+  const char **bare_urls = NULL;
+  size_t bare_count = 0;
+
   for (size_t i = 0; i < spec_count; i++) {
     // Compute the URL that JSC will resolve this specifier to
     char *child_url = js__resolve_module_url(specifiers[i], base_url);
-    { char logbuf[2200]; snprintf(logbuf, sizeof(logbuf), "resolving spec='%s' -> url='%s'", specifiers[i], child_url); js__nslog(logbuf); }
+
+    // Check if this is a bare specifier (needs rewriting)
+    bool is_bare = (specifiers[i][0] != '.' && specifiers[i][0] != '/');
+    if (specifiers[i][0] == '.' && specifiers[i][1] == '/') is_bare = false;
+    if (specifiers[i][0] == '.' && specifiers[i][1] == '.' && specifiers[i][2] == '/') is_bare = false;
 
     // Skip if already registered (prevents cycles and duplicates)
     if (js__module_delegate_lookup(env->module_loader_delegate, child_url) != NULL) {
-      js__nslog("already registered, skipping");
-      free(child_url);
+      if (is_bare) {
+        if (bare_specs == NULL) {
+          bare_specs = malloc(spec_count * sizeof(char *));
+          bare_urls = malloc(spec_count * sizeof(char *));
+        }
+        bare_specs[bare_count] = specifiers[i];
+        bare_urls[bare_count] = child_url; // transfer ownership
+        bare_count++;
+      } else {
+        free(child_url);
+      }
       continue;
     }
 
@@ -1344,14 +1484,27 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
     );
 
     if (child == NULL) {
-      // Resolve callback returned NULL — missing module.
-      // Set an error but continue (create-module-import-missing test expects this).
-      free(child_url);
+      if (is_bare) free(child_url);
+      else free(child_url);
       if (env->exception) {
         js__free_import_specifiers(specifiers, spec_count);
+        for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
+        free(bare_specs); free(bare_urls);
         return js__error(env);
       }
       continue;
+    }
+
+    // Record bare specifier mapping before recursing (child_url may be needed)
+    if (is_bare) {
+      if (bare_specs == NULL) {
+        bare_specs = malloc(spec_count * sizeof(char *));
+        bare_urls = malloc(spec_count * sizeof(char *));
+      }
+      // Duplicate child_url since we also pass it to recursive call
+      bare_specs[bare_count] = specifiers[i];
+      bare_urls[bare_count] = strdup(child_url);
+      bare_count++;
     }
 
     // Recursively instantiate the child at the resolved URL
@@ -1360,11 +1513,49 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
 
     if (err != 0) {
       js__free_import_specifiers(specifiers, spec_count);
+      for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
+      free(bare_specs); free(bare_urls);
       return err;
     }
   }
 
+  // Rewrite bare specifiers in the source if any were found
+  const char *final_source = module->source;
+  char *rewritten = NULL;
+
+  if (bare_count > 0) {
+    rewritten = js__rewrite_bare_specifiers(module->source,
+                                            bare_specs, bare_urls, bare_count);
+    if (rewritten) {
+      final_source = rewritten;
+    }
+  }
+
+  // Now create JSScript from the (possibly rewritten) source
+  if (module->jsc_script == NULL) {
+    module->jsc_script = js__module_script_create(
+      env->objc_context, final_source, base_url);
+
+    if (module->jsc_script == NULL) {
+      int err = js_throw_error(env, NULL, "Failed to create module script");
+      assert(err == 0);
+      if (rewritten) free(rewritten);
+      js__free_import_specifiers(specifiers, spec_count);
+      for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
+      free(bare_specs); free(bare_urls);
+      return js__error(env);
+    }
+  }
+
+  if (rewritten) free(rewritten);
+
+  // Register in delegate's registry
+  js__module_delegate_register(env->module_loader_delegate, base_url, module);
+
   js__free_import_specifiers(specifiers, spec_count);
+  for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
+  free(bare_specs);
+  free(bare_urls);
   return 0;
 }
 
@@ -1423,30 +1614,41 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSObjectSetProperty(env->context, global, mp_key, jsc_promise, 0, NULL);
   JSStringRelease(mp_key);
 
-  // Build the module URL for the namespace import
-  char mod_url[4096];
-  snprintf(mod_url, sizeof(mod_url), "file:///bare-modules/%s", module->name);
-
-  // Set up state tracking + namespace capture via import()
-  // The import() re-uses the already-evaluated module from JSC's cache,
-  // giving us the namespace object.
-  char chain_buf[8192];
-  snprintf(chain_buf, sizeof(chain_buf),
-    "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined; globalThis.__jsc_mns = undefined;"
+  // Set up state tracking for the evaluation promise
+  JSStringRef chain_code = JSStringCreateWithUTF8CString(
+    "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined;"
     "__jsc_mp.then("
-    "  function(v) {"
-    "    globalThis.__jsc_ms = 1; globalThis.__jsc_mr = v;"
-    "    return import('%s').then(function(ns) { globalThis.__jsc_mns = ns; });"
-    "  },"
+    "  function(v) { globalThis.__jsc_ms = 1; globalThis.__jsc_mr = v; },"
     "  function(r) { globalThis.__jsc_ms = 2; globalThis.__jsc_mr = r; }"
-    ")", mod_url);
-  JSStringRef chain_code = JSStringCreateWithUTF8CString(chain_buf);
+    ")");
   JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
   JSStringRelease(chain_code);
 
-  // Drain microtasks multiple times to allow the full promise chain
-  // (evaluation → import() → .then(ns)) to resolve.
+  // Drain microtasks to resolve the evaluation promise
   for (int i = 0; i < 4; i++) {
+    JSStringRef drain = JSStringCreateWithUTF8CString("0");
+    JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
+    JSStringRelease(drain);
+  }
+
+  // Now capture namespace via a separate import() call.
+  // The module should be cached by JSC from the evaluation above.
+  char mod_url[4096];
+  snprintf(mod_url, sizeof(mod_url), "file:///bare-modules/%s", module->name);
+
+  char import_buf[8192];
+  snprintf(import_buf, sizeof(import_buf),
+    "globalThis.__jsc_mns = undefined;"
+    "import('%s').then("
+    "  function(ns) { globalThis.__jsc_mns = ns; },"
+    "  function(e) { globalThis.__jsc_mns = null; }"
+    ")", mod_url);
+  JSStringRef import_code = JSStringCreateWithUTF8CString(import_buf);
+  JSEvaluateScript(env->context, import_code, NULL, NULL, 0, NULL);
+  JSStringRelease(import_code);
+
+  // Drain microtasks aggressively for the import() to resolve
+  for (int i = 0; i < 8; i++) {
     JSStringRef drain = JSStringCreateWithUTF8CString("0");
     JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
     JSStringRelease(drain);
@@ -1466,6 +1668,15 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSStringRef mns_key = JSStringCreateWithUTF8CString("__jsc_mns");
   JSValueRef mns_val = JSObjectGetProperty(env->context, global, mns_key, NULL);
   JSStringRelease(mns_key);
+
+  {
+    char logbuf[256];
+    snprintf(logbuf, sizeof(logbuf), "js_run_module: state=%d, namespace=%s",
+             state,
+             JSValueIsUndefined(env->context, mns_val) ? "undefined" :
+             JSValueIsNull(env->context, mns_val) ? "null" : "captured");
+    js__nslog(logbuf);
+  }
 
   if (!JSValueIsUndefined(env->context, mns_val) && !JSValueIsNull(env->context, mns_val)) {
     module->namespace_ref = mns_val;
