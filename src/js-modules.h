@@ -4,6 +4,7 @@
 #include <JavaScriptCore/JavaScriptCore.h>
 
 typedef struct js_env_s js_env_t;
+typedef struct js_module_s js_module_t;
 
 // Create a JSContext via Obj-C API (required for module loader support).
 // Returns a retained void* (JSContext*). Sets *out_ctx to the underlying
@@ -14,8 +15,8 @@ js__objc_context_create(JSGlobalContextRef *out_ctx, JSContextGroupRef *out_grou
 void
 js__objc_context_release(void *objc_context);
 
-// Module loader delegate — routes module fetches to the C resolve callback
-// stored on the env's current_loading_module.
+// Module loader delegate — maintains a registry of pre-resolved modules
+// and provides them to JSC when requested during evaluation.
 void *
 js__module_delegate_create(js_env_t *env);
 
@@ -24,6 +25,16 @@ js__module_delegate_release(void *delegate);
 
 void
 js__module_delegate_set(void *objc_context, void *delegate);
+
+// Register a module in the delegate's registry by URL.
+// The URL should match what JSC will use when requesting the module.
+void
+js__module_delegate_register(void *delegate, const char *url, js_module_t *module);
+
+// Look up a module in the delegate's registry by URL.
+// Returns NULL if not found.
+js_module_t *
+js__module_delegate_lookup(void *delegate, const char *url);
 
 // JSScript creation. Returns a retained void* (JSScript*).
 // `source` is UTF-8, `url` is a URL string for module identity.

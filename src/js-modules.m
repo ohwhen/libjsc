@@ -6,10 +6,6 @@
 
 #include "js-modules.h"
 
-// Forward declarations for internal struct fields we access.
-// These must match the layout in js.c.
-typedef struct js_module_s js_module_t;
-
 // Redeclare JSC private/SPI interfaces. Symbols are exported in the system
 // framework since iOS 13 / macOS 10.15.
 typedef NS_ENUM(NSInteger, JSScriptType) {
@@ -32,42 +28,36 @@ typedef NS_ENUM(NSInteger, JSScriptType) {
 @end
 
 // -----------------------------------------------------------------------
-// Module loader delegate
+// Module loader delegate — registry-based
 // -----------------------------------------------------------------------
+// All modules are pre-resolved and registered during js_instantiate_module.
+// The delegate simply looks them up by URL when JSC requests them.
 
-// We need access to the module struct internals and the env's
-// current_loading_module. These are defined in js.c and we reference them
-// through opaque pointers + helper functions declared in js-modules.h.
-//
-// The delegate stores a back-pointer to js_env_t and uses the public
-// js.h API plus the module struct accessors to drive resolution.
-
-@interface JSCModuleDelegate : NSObject {
-  @public
-  js_env_t *env;
-}
-@end
-
-// These accessor functions are implemented in js.c and give us access to
-// the module struct fields without exposing the full struct definition.
-extern js_module_t *js__env_get_current_module(js_env_t *env);
-extern void js__env_set_current_module(js_env_t *env, js_module_t *module);
-extern const char *js__module_get_name(js_module_t *module);
-extern const char *js__module_get_source(js_module_t *module);
-extern bool js__module_is_synthetic(js_module_t *module);
+// Accessor functions implemented in js.c
 extern void *js__module_get_script(js_module_t *module);
-extern void js__module_set_script(js_module_t *module, void *script);
-extern void *js__module_get_resolve_cb(js_module_t *module);
-extern void *js__module_get_resolve_data(js_module_t *module);
-extern void js__module_set_resolve_cb(js_module_t *module, void *cb, void *data);
-extern void js__module_call_evaluate(js_env_t *env, js_module_t *module);
-extern void *js__env_get_objc_context(js_env_t *env);
+extern const char *js__module_get_name(js_module_t *module);
+extern bool js__module_is_synthetic(js_module_t *module);
 extern JSObjectRef js__module_get_pending_exports(js_module_t *module);
 
 // URL prefix used for module identity
 static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
 
+@interface JSCModuleDelegate : NSObject {
+  @public
+  js_env_t *env;
+  NSMutableDictionary<NSString *, NSValue *> *moduleRegistry;
+}
+@end
+
 @implementation JSCModuleDelegate
+
+- (instancetype)init {
+  self = [super init];
+  if (self) {
+    moduleRegistry = [[NSMutableDictionary alloc] init];
+  }
+  return self;
+}
 
 - (void)context:(JSContext *)context
     fetchModuleForIdentifier:(JSValue *)identifier
@@ -76,146 +66,72 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
 
   NSString *idStr = [identifier toString];
 
-  // Strip our URL prefix to get the module name / specifier
-  NSString *specifier = idStr;
-  if ([idStr hasPrefix:kModuleURLPrefix]) {
-    specifier = [idStr substringFromIndex:kModuleURLPrefix.length];
-  }
+  // Look up in registry
+  NSValue *entry = moduleRegistry[idStr];
 
-  js_module_t *current = js__env_get_current_module(env);
-
-  NSLog(@"[libjsc] delegate: identifier='%@' specifier='%@' current=%p", idStr, specifier, (void *)current);
-
-  // --- Root module fetch ---
-  // If the fetched identifier matches the current module being evaluated,
-  // provide its pre-created JSScript.
-  if (current != NULL) {
-    const char *currentName = js__module_get_name(current);
-    NSLog(@"[libjsc] delegate: checking root match: specifier='%@' vs currentName='%s'", specifier, currentName);
-    if (currentName && [specifier isEqualToString:@(currentName)]) {
-      void *script = js__module_get_script(current);
-      if (script) {
-        [resolve callWithArguments:@[(__bridge JSScript *)script]];
-        return;
-      }
+  if (entry == nil) {
+    // Try stripping any trailing whitespace or normalization differences
+    // Also try without the prefix for backwards compatibility
+    NSString *stripped = idStr;
+    if ([idStr hasPrefix:kModuleURLPrefix]) {
+      stripped = [idStr substringFromIndex:kModuleURLPrefix.length];
+      NSString *altKey = [NSString stringWithFormat:@"%@%@",
+                          kModuleURLPrefix, stripped];
+      entry = moduleRegistry[altKey];
     }
   }
 
-  // --- Dependency fetch ---
-  // Call the C resolve callback to get the child module.
-  if (current == NULL) {
-    NSLog(@"JSCModuleDelegate: no current module for dependency %@", specifier);
+  if (entry == nil) {
+    fprintf(stderr, "[libjsc] delegate: module NOT FOUND in registry: '%s'\n",
+            idStr.UTF8String);
     [reject callWithArguments:@[
       [JSValue valueWithNewErrorFromMessage:
-        [NSString stringWithFormat:@"No current module context for: %@", specifier]
+        [NSString stringWithFormat:@"Module not found in registry: %@", idStr]
         inContext:context]
     ]];
     return;
   }
 
-  // Get the resolve callback from the current (referrer) module
-  js_module_resolve_cb resolve_cb =
-    (js_module_resolve_cb)js__module_get_resolve_cb(current);
-  void *resolve_data = js__module_get_resolve_data(current);
+  js_module_t *module = (js_module_t *)[entry pointerValue];
+  void *script = js__module_get_script(module);
 
-  if (resolve_cb == NULL) {
+  if (script == NULL) {
+    fprintf(stderr, "[libjsc] delegate: module has no JSScript: '%s'\n",
+            idStr.UTF8String);
     [reject callWithArguments:@[
       [JSValue valueWithNewErrorFromMessage:
-        [NSString stringWithFormat:@"No resolve callback for: %@", specifier]
+        [NSString stringWithFormat:@"Module has no script: %@", idStr]
         inContext:context]
     ]];
     return;
   }
 
-  // Create a JS string value for the specifier
-  JSGlobalContextRef ctx = context.JSGlobalContextRef;
-  JSStringRef specStr = JSStringCreateWithUTF8CString(specifier.UTF8String);
-  JSValueRef specVal = JSValueMakeString(ctx, specStr);
-  JSStringRelease(specStr);
+  // For synthetic modules: ensure globalThis exports are set up
+  if (js__module_is_synthetic(module)) {
+    JSGlobalContextRef ctx = context.JSGlobalContextRef;
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
 
-  // Assertions: pass undefined
-  JSValueRef assertions = JSValueMakeUndefined(ctx);
+    JSStringRef synKey = JSStringCreateWithUTF8CString("__jsc_syn");
+    JSValueRef synVal = JSObjectGetProperty(ctx, global, synKey, NULL);
 
-  // Call the C resolve callback
-  js_module_t *child = resolve_cb(
-    env,
-    (js_value_t *)specVal,
-    (js_value_t *)assertions,
-    current,
-    resolve_data
-  );
-
-  if (child == NULL) {
-    [reject callWithArguments:@[
-      [JSValue valueWithNewErrorFromMessage:
-        [NSString stringWithFormat:@"Module not found: %@", specifier]
-        inContext:context]
-    ]];
-    return;
-  }
-
-  // Propagate resolve callback to child if it doesn't have one
-  if (js__module_get_resolve_cb(child) == NULL) {
-    js__module_set_resolve_cb(child, (void *)resolve_cb, resolve_data);
-  }
-
-  // Create JSScript for the child module if not already created
-  void *childScript = js__module_get_script(child);
-  if (childScript == NULL) {
-    const char *childSource = js__module_get_source(child);
-    const char *childName = js__module_get_name(child);
-
-    if (childSource == NULL) {
-      [reject callWithArguments:@[
-        [JSValue valueWithNewErrorFromMessage:
-          [NSString stringWithFormat:@"Module has no source: %@", @(childName)]
-          inContext:context]
-      ]];
-      return;
+    if (JSValueIsUndefined(ctx, synVal)) {
+      JSObjectRef synObj = JSObjectMake(ctx, NULL, NULL);
+      JSObjectSetProperty(ctx, global, synKey, (JSValueRef)synObj, 0, NULL);
+      synVal = (JSValueRef)synObj;
     }
+    JSStringRelease(synKey);
 
-    // For synthetic modules: call the evaluate callback and set up
-    // globalThis exports BEFORE creating/evaluating the script.
-    if (js__module_is_synthetic(child)) {
-      js__module_call_evaluate(env, child);
-
-      // Set globalThis.__jsc_syn[name] = pending_exports
-      JSObjectRef global = JSContextGetGlobalObject(ctx);
-
-      JSStringRef synKey = JSStringCreateWithUTF8CString("__jsc_syn");
-      JSValueRef synVal = JSObjectGetProperty(ctx, global, synKey, NULL);
-
-      if (JSValueIsUndefined(ctx, synVal)) {
-        JSObjectRef synObj = JSObjectMake(ctx, NULL, NULL);
-        JSObjectSetProperty(ctx, global, synKey, (JSValueRef)synObj, 0, NULL);
-        synVal = (JSValueRef)synObj;
-      }
-      JSStringRelease(synKey);
-
-      JSObjectRef pendingExports = js__module_get_pending_exports(child);
-      if (pendingExports) {
-        JSStringRef nameKey = JSStringCreateWithUTF8CString(childName);
-        JSObjectSetProperty(ctx, (JSObjectRef)synVal, nameKey,
-                            (JSValueRef)pendingExports, 0, NULL);
-        JSStringRelease(nameKey);
-      }
+    JSObjectRef pendingExports = js__module_get_pending_exports(module);
+    if (pendingExports) {
+      const char *modName = js__module_get_name(module);
+      JSStringRef nameKey = JSStringCreateWithUTF8CString(modName);
+      JSObjectSetProperty(ctx, (JSObjectRef)synVal, nameKey,
+                          (JSValueRef)pendingExports, 0, NULL);
+      JSStringRelease(nameKey);
     }
-
-    NSString *urlStr = [NSString stringWithFormat:@"%@%s",
-                        kModuleURLPrefix, childName];
-    childScript = js__module_script_create(
-      js__env_get_objc_context(env), childSource, urlStr.UTF8String
-    );
-    js__module_set_script(child, childScript);
   }
 
-  // Save / restore current_loading_module for recursive resolution
-  js_module_t *saved = js__env_get_current_module(env);
-  js__env_set_current_module(env, child);
-
-  [resolve callWithArguments:@[(__bridge JSScript *)childScript]];
-
-  js__env_set_current_module(env, saved);
+  [resolve callWithArguments:@[(__bridge JSScript *)script]];
 }
 
 @end
@@ -264,6 +180,22 @@ js__module_delegate_set(void *objc_context, void *delegate) {
   ctx.moduleLoaderDelegate = d;
 }
 
+void
+js__module_delegate_register(void *delegate, const char *url, js_module_t *module) {
+  JSCModuleDelegate *d = (__bridge JSCModuleDelegate *)delegate;
+  NSString *key = [NSString stringWithUTF8String:url];
+  d->moduleRegistry[key] = [NSValue valueWithPointer:module];
+}
+
+js_module_t *
+js__module_delegate_lookup(void *delegate, const char *url) {
+  JSCModuleDelegate *d = (__bridge JSCModuleDelegate *)delegate;
+  NSString *key = [NSString stringWithUTF8String:url];
+  NSValue *entry = d->moduleRegistry[key];
+  if (entry == nil) return NULL;
+  return (js_module_t *)[entry pointerValue];
+}
+
 void *
 js__module_script_create(void *objc_context, const char *source, const char *url) {
   JSContext *ctx = (__bridge JSContext *)objc_context;
@@ -279,7 +211,7 @@ js__module_script_create(void *objc_context, const char *source, const char *url
                          inVirtualMachine:ctx.virtualMachine
                                     error:&error];
   if (error) {
-    NSLog(@"js__module_script_create error: %@", error);
+    NSLog(@"js__module_script_create error for '%s': %@", url, error);
     return NULL;
   }
 
