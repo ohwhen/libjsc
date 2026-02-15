@@ -249,6 +249,22 @@ int
 js_create_platform(uv_loop_t *loop, const js_platform_options_t *options, js_platform_t **result) {
   int err;
 
+  // Increase stack limit for deep module graphs (ESM with 600+ modules).
+  // JSC defaults to ~5MB but clamps to the OS thread stack size. On iOS
+  // secondary threads the default is 512KB which is too small for deep
+  // module resolution chains. Setting this higher lets JSC use more of
+  // the available thread stack when the thread is created with a larger
+  // stack (e.g. via pthread_attr_setstacksize or worklet thread config).
+  err = uv_os_setenv("JSC_maxPerThreadStackUsage", "16777216");
+  assert(err == 0);
+
+  // Reduce reserved zone sizes to leave more usable stack space.
+  err = uv_os_setenv("JSC_softReservedZoneSize", "65536");
+  assert(err == 0);
+
+  err = uv_os_setenv("JSC_reservedZoneSize", "32768");
+  assert(err == 0);
+
   if (options) {
     if (options->trace_garbage_collection) {
       err = uv_os_setenv("JSC_logGC", "true");
@@ -1673,11 +1689,21 @@ int
 js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb cb, void *data) {
   if (env->exception) return js__error(env);
 
+  size_t count_before = env->module_eval_count;
+
   // Compute the base URL for this module
   char url[2048];
   snprintf(url, sizeof(url), "file:///bare-modules/%s", module->name);
 
-  return js__instantiate_module_at_url(env, module, cb, data, url);
+  int result = js__instantiate_module_at_url(env, module, cb, data, url);
+
+  { char logbuf[512]; snprintf(logbuf, sizeof(logbuf),
+    "js_instantiate_module: name='%s' cb=%p eval_count: %zu -> %zu (result=%d)",
+    module->name ? module->name : "(null)", (void*)cb,
+    count_before, env->module_eval_count, result);
+    js__nslog(logbuf); }
+
+  return result;
 }
 
 int
