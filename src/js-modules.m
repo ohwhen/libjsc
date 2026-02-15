@@ -46,14 +46,15 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   @public
   js_env_t *env;
   NSMutableDictionary<NSString *, NSValue *> *moduleRegistry;
-  int resolveDepth;  // Current synchronous resolution depth
+  int resolveCount;    // Total synchronous resolves in current batch
+  int resolveDepth;    // Current nesting depth for recursion tracking
 }
 @end
 
-// Maximum depth of synchronous delegate resolution before deferring.
-// JSC's default JS stack is ~10K frames. Each module resolution adds ~5-10
-// frames. Limit to 30 levels to leave headroom for module evaluation code.
-static const int kMaxResolveDepth = 30;
+// After this many synchronous resolves, defer the next batch to the run loop.
+// JSC's JS stack (~10K frames) overflows around 200+ module evaluations.
+// This breaks the chain into manageable chunks.
+static const int kMaxResolveBatch = 20;
 
 @implementation JSCModuleDelegate
 
@@ -61,6 +62,7 @@ static const int kMaxResolveDepth = 30;
   self = [super init];
   if (self) {
     moduleRegistry = [[NSMutableDictionary alloc] init];
+    resolveCount = 0;
     resolveDepth = 0;
   }
   return self;
@@ -140,26 +142,23 @@ static const int kMaxResolveDepth = 30;
     }
   }
 
-  // Trampoline: resolve synchronously up to kMaxResolveDepth levels.
-  // When JSC resolves a module, it immediately evaluates it, triggering more
-  // delegate calls for that module's imports — creating deep recursion.
-  // With 200+ modules this causes "Maximum call stack size exceeded".
-  //
-  // We allow up to kMaxResolveDepth levels of synchronous resolution (which
-  // is fast and stays within stack limits), then defer to the next run loop
-  // iteration. When the deferred blocks fire, resolveDepth resets to 0,
-  // allowing another kMaxResolveDepth levels.
+  // Batch-limited resolution: resolve synchronously up to kMaxResolveBatch
+  // modules, then defer remaining resolutions to the next run loop iteration.
+  // JSC evaluates resolved modules via microtask chaining; 200+ modules in
+  // a single batch overflows the JS stack (RangeError: Maximum call stack
+  // size exceeded). Breaking into batches of 20 keeps the stack manageable.
+  // When deferred blocks fire, resolveCount resets, allowing the next batch.
   JSScript *s = (__bridge JSScript *)script;
 
-  if (resolveDepth < kMaxResolveDepth) {
-    resolveDepth++;
+  if (resolveCount < kMaxResolveBatch) {
+    resolveCount++;
     [resolve callWithArguments:@[s]];
-    resolveDepth--;
   } else {
+    // Defer to next run loop iteration; reset counter for the new batch
     CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopDefaultMode, ^{
-      self->resolveDepth++;
+      self->resolveCount = 0;
       [resolve callWithArguments:@[s]];
-      self->resolveDepth--;
+      self->resolveCount++;
     });
     CFRunLoopWakeUp(CFRunLoopGetMain());
   }
