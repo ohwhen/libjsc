@@ -1677,15 +1677,15 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
     JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
     JSStringRelease(chain_code);
 
-    // Drain microtasks + run loop to resolve
-    JSStringRef check = JSStringCreateWithUTF8CString("globalThis.__jsc_ms");
+    // Drain microtasks via Obj-C evaluateScript: API, which may have
+    // different microtask processing than the C API JSEvaluateScript.
+    // The C API doesn't drain microtasks when called from within a
+    // native function invoked by JavaScript (reentrancy guard).
     int iterations = 0;
-    for (; iterations < 100 && state == 0; iterations++) {
+    for (; iterations < 500 && state == 0; iterations++) {
       js__drain_run_loop();
-      JSValueRef val = JSEvaluateScript(env->context, check, NULL, NULL, 0, NULL);
-      state = (int) JSValueToNumber(env->context, val, NULL);
+      state = js__objc_eval_int(env->objc_context, "globalThis.__jsc_ms");
     }
-    JSStringRelease(check);
 
     {
       char logbuf[128];

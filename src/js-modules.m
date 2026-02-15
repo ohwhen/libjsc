@@ -158,6 +158,15 @@ js__drain_run_loop(void) {
   return handled ? 1 : 0;
 }
 
+int
+js__objc_eval_int(void *objc_context, const char *expr) {
+  JSContext *ctx = (__bridge JSContext *)objc_context;
+  NSString *script = [NSString stringWithUTF8String:expr];
+  JSValue *result = [ctx evaluateScript:script];
+  if (result == nil || [result isUndefined]) return 0;
+  return [result toInt32];
+}
+
 void *
 js__objc_context_create(JSGlobalContextRef *out_ctx, JSContextGroupRef *out_group) {
   JSContext *ctx = [[JSContext alloc] init];

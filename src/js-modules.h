@@ -67,4 +67,10 @@ js__nslog(const char *msg);
 int
 js__drain_run_loop(void);
 
+// Evaluate a JS expression via the Obj-C JSContext API and return the
+// integer result. The Obj-C API may have different microtask drain
+// behavior than the C API JSEvaluateScript.
+int
+js__objc_eval_int(void *objc_context, const char *expr);
+
 #endif // JS_MODULES_H
