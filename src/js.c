@@ -123,6 +123,7 @@ struct js_ref_s {
 struct js_deferred_s {
   JSObjectRef resolve;
   JSObjectRef reject;
+  JSObjectRef promise;
 };
 
 struct js_string_view_s {
@@ -700,7 +701,7 @@ int
 js_create_context(js_env_t *env, js_context_t **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_create_context");
   assert(err == 0);
 
   return js__error(env);
@@ -710,7 +711,7 @@ int
 js_destroy_context(js_env_t *env, js_context_t *context) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_destroy_context");
   assert(err == 0);
 
   return js__error(env);
@@ -720,7 +721,7 @@ int
 js_enter_context(js_env_t *env, js_context_t *context) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_enter_context");
   assert(err == 0);
 
   return js__error(env);
@@ -730,7 +731,7 @@ int
 js_exit_context(js_env_t *env, js_context_t *context) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_exit_context");
   assert(err == 0);
 
   return js__error(env);
@@ -784,7 +785,7 @@ int
 js_create_module(js_env_t *env, const char *name, size_t len, int offset, js_value_t *source, js_module_meta_cb cb, void *data, js_module_t **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_create_module");
   assert(err == 0);
 
   return js__error(env);
@@ -795,7 +796,7 @@ int
 js_create_synthetic_module(js_env_t *env, const char *name, size_t len, js_value_t *const export_names[], size_t names_len, js_module_evaluate_cb cb, void *data, js_module_t **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_create_synthetic_module");
   assert(err == 0);
 
   return js__error(env);
@@ -806,7 +807,7 @@ int
 js_delete_module(js_env_t *env, js_module_t *module) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_delete_module");
   assert(err == 0);
 
   return js__error(env);
@@ -817,7 +818,7 @@ int
 js_get_module_name(js_env_t *env, js_module_t *module, const char **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_get_module_name");
   assert(err == 0);
 
   return js__error(env);
@@ -828,7 +829,7 @@ int
 js_get_module_namespace(js_env_t *env, js_module_t *module, js_value_t **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_get_module_namespace");
   assert(err == 0);
 
   return js__error(env);
@@ -839,7 +840,7 @@ int
 js_set_module_export(js_env_t *env, js_module_t *module, js_value_t *name, js_value_t *value) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_set_module_export");
   assert(err == 0);
 
   return js__error(env);
@@ -850,7 +851,7 @@ int
 js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb cb, void *data) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_instantiate_module");
   assert(err == 0);
 
   return js__error(env);
@@ -861,7 +862,7 @@ int
 js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_run_module");
   assert(err == 0);
 
   return js__error(env);
@@ -1724,6 +1725,16 @@ js_create_bigint_uint64(js_env_t *env, uint64_t value, js_value_t **result) {
 }
 
 int
+js_create_bigint_words(js_env_t *env, int sign, const uint64_t *words, size_t len, js_value_t **result) {
+  int err;
+
+  err = js_throw_error(env, NULL, "Unsupported operation: js_create_bigint_words");
+  assert(err == 0);
+
+  return js__error(env);
+}
+
+int
 js_create_string_utf8(js_env_t *env, const utf8_t *str, size_t len, js_value_t **result) {
   // Allow continuing even with a pending exception
 
@@ -1883,7 +1894,7 @@ int
 js_symbol_for(js_env_t *env, const char *description, size_t len, js_value_t **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_symbol_for");
   assert(err == 0);
 
   return js__error(env);
@@ -2414,6 +2425,12 @@ js_create_promise(js_env_t *env, js_deferred_t **deferred, js_value_t **promise)
 
   result->resolve = resolve;
   result->reject = reject;
+  result->promise = value;
+
+  // Track promise state via private properties
+  JSStringRef state_key = JSStringCreateWithUTF8CString("__ps");
+  JSObjectSetPrivateProperty(env->context, value, state_key, JSValueMakeNumber(env->context, 0));
+  JSStringRelease(state_key);
 
   *deferred = result;
   *promise = (js_value_t *) value;
@@ -2435,6 +2452,15 @@ js_resolve_deferred(js_env_t *env, js_deferred_t *deferred, js_value_t *resoluti
 
   assert(exception == NULL);
 
+  // Update promise state tracking
+  JSStringRef state_key = JSStringCreateWithUTF8CString("__ps");
+  JSObjectSetPrivateProperty(env->context, deferred->promise, state_key, JSValueMakeNumber(env->context, 1));
+  JSStringRelease(state_key);
+
+  JSStringRef result_key = JSStringCreateWithUTF8CString("__pr");
+  JSObjectSetPrivateProperty(env->context, deferred->promise, result_key, (JSValueRef) resolution);
+  JSStringRelease(result_key);
+
   free(deferred);
 
   return 0;
@@ -2452,31 +2478,71 @@ js_reject_deferred(js_env_t *env, js_deferred_t *deferred, js_value_t *resolutio
 
   assert(exception == NULL);
 
+  // Update promise state tracking
+  JSStringRef state_key = JSStringCreateWithUTF8CString("__ps");
+  JSObjectSetPrivateProperty(env->context, deferred->promise, state_key, JSValueMakeNumber(env->context, 2));
+  JSStringRelease(state_key);
+
+  JSStringRef result_key = JSStringCreateWithUTF8CString("__pr");
+  JSObjectSetPrivateProperty(env->context, deferred->promise, result_key, (JSValueRef) resolution);
+  JSStringRelease(result_key);
+
   free(deferred);
 
   return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=250554
+// Promise state tracking via private properties set in js_create_promise,
+// js_resolve_deferred, and js_reject_deferred.
 int
 js_get_promise_state(js_env_t *env, js_value_t *promise, js_promise_state_t *result) {
-  int err;
+  // Allow continuing even with a pending exception
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  JSStringRef state_key = JSStringCreateWithUTF8CString("__ps");
+  JSValueRef state_val = JSObjectGetPrivateProperty(env->context, (JSObjectRef) promise, state_key);
+  JSStringRelease(state_key);
 
-  return js__error(env);
+  if (state_val && !JSValueIsUndefined(env->context, state_val) && JSValueIsNumber(env->context, state_val)) {
+    int state = (int) JSValueToNumber(env->context, state_val, NULL);
+
+    switch (state) {
+    case 1:
+      *result = js_promise_fulfilled;
+      break;
+    case 2:
+      *result = js_promise_rejected;
+      break;
+    default:
+      *result = js_promise_pending;
+      break;
+    }
+  } else {
+    *result = js_promise_pending;
+  }
+
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=250554
 int
 js_get_promise_result(js_env_t *env, js_value_t *promise, js_value_t **result) {
-  int err;
+  // Allow continuing even with a pending exception
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  JSStringRef result_key = JSStringCreateWithUTF8CString("__pr");
+  JSValueRef value = JSObjectGetPrivateProperty(env->context, (JSObjectRef) promise, result_key);
+  JSStringRelease(result_key);
 
-  return js__error(env);
+  if (value && !JSValueIsUndefined(env->context, value)) {
+    *result = (js_value_t *) value;
+
+    js__attach_to_handle_scope(env, env->scope, value);
+  } else {
+    JSValueRef undefined = JSValueMakeUndefined(env->context);
+    *result = (js_value_t *) undefined;
+
+    js__attach_to_handle_scope(env, env->scope, undefined);
+  }
+
+  return 0;
 }
 
 int
@@ -2641,59 +2707,137 @@ js_get_arraybuffer_backing_store(js_env_t *env, js_value_t *arraybuffer, js_arra
   return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=257709
+// SharedArrayBuffer implemented using regular ArrayBuffer with shared backing memory.
+// JSC lacks a dedicated SharedArrayBuffer C API, so we use ArrayBuffer with
+// JSObjectMakeArrayBufferWithBytesNoCopy to share the same data pointer across threads.
+
 int
 js_create_sharedarraybuffer(js_env_t *env, size_t len, void **data, js_value_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  void *bytes = calloc(1, len);
 
-  return js__error(env);
+  JSObjectRef arraybuffer = JSObjectMakeArrayBufferWithBytesNoCopy(env->context, bytes, len, js__on_unsafe_arraybuffer_finalize, NULL, &env->exception);
+
+  if (env->exception) {
+    free(bytes);
+
+    return js__propagate_exception(env);
+  }
+
+  *result = (js_value_t *) arraybuffer;
+
+  if (data) {
+    *data = bytes;
+  }
+
+  js__attach_to_handle_scope(env, env->scope, arraybuffer);
+
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=257709
 int
 js_create_sharedarraybuffer_with_backing_store(js_env_t *env, js_arraybuffer_backing_store_t *backing_store, void **data, size_t *len, js_value_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  JSObjectRef arraybuffer = JSObjectMakeArrayBufferWithBytesNoCopy(env->context, backing_store->data, backing_store->len, js__on_backed_arraybuffer_finalize, backing_store, &env->exception);
 
-  return js__error(env);
+  if (env->exception) return js__propagate_exception(env);
+
+  backing_store->references++;
+
+  *result = (js_value_t *) arraybuffer;
+
+  if (data) {
+    *data = backing_store->data;
+  }
+
+  if (len) {
+    *len = backing_store->len;
+  }
+
+  js__attach_to_handle_scope(env, env->scope, arraybuffer);
+
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=257709
 int
 js_create_unsafe_sharedarraybuffer(js_env_t *env, size_t len, void **data, js_value_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  void *bytes = malloc(len);
 
-  return js__error(env);
+  JSObjectRef arraybuffer = JSObjectMakeArrayBufferWithBytesNoCopy(env->context, bytes, len, js__on_unsafe_arraybuffer_finalize, NULL, &env->exception);
+
+  if (env->exception) {
+    free(bytes);
+
+    return js__propagate_exception(env);
+  }
+
+  *result = (js_value_t *) arraybuffer;
+
+  if (data) {
+    *data = bytes;
+  }
+
+  js__attach_to_handle_scope(env, env->scope, arraybuffer);
+
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=257709
 int
 js_create_external_sharedarraybuffer(js_env_t *env, void *data, size_t len, js_finalize_cb finalize_cb, void *finalize_hint, js_value_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  js_finalizer_t *finalizer = malloc(sizeof(js_finalizer_t));
 
-  return js__error(env);
+  finalizer->env = env;
+  finalizer->data = data;
+  finalizer->finalize_cb = finalize_cb;
+  finalizer->finalize_hint = finalize_hint;
+
+  JSObjectRef arraybuffer = JSObjectMakeArrayBufferWithBytesNoCopy(env->context, data, len, js__on_external_arraybuffer_finalize, (void *) finalizer, &env->exception);
+
+  if (env->exception) {
+    free(finalizer);
+
+    return js__propagate_exception(env);
+  }
+
+  *result = (js_value_t *) arraybuffer;
+
+  js__attach_to_handle_scope(env, env->scope, arraybuffer);
+
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=257709
 int
 js_get_sharedarraybuffer_backing_store(js_env_t *env, js_value_t *sharedarraybuffer, js_arraybuffer_backing_store_t **result) {
-  int err;
+  // Allow continuing even with a pending exception
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  JSValueRef exception = NULL;
 
-  return js__error(env);
+  js_arraybuffer_backing_store_t *backing_store = malloc(sizeof(js_arraybuffer_backing_store_t));
+
+  backing_store->env = env;
+  backing_store->references = 1;
+
+  backing_store->data = JSObjectGetArrayBufferBytesPtr(env->context, (JSObjectRef) sharedarraybuffer, &exception);
+
+  assert(exception == NULL);
+
+  backing_store->len = JSObjectGetArrayBufferByteLength(env->context, (JSObjectRef) sharedarraybuffer, &exception);
+
+  assert(exception == NULL);
+
+  backing_store->owner = (JSValueRef) sharedarraybuffer;
+
+  JSValueProtect(env->context, backing_store->owner);
+
+  *result = backing_store;
+
+  return 0;
 }
 
 int
@@ -3807,6 +3951,16 @@ js_get_value_bigint_uint64(js_env_t *env, js_value_t *value, uint64_t *result, b
 }
 
 int
+js_get_value_bigint_words(js_env_t *env, js_value_t *value, int *sign, uint64_t *words, size_t len, size_t *result) {
+  int err;
+
+  err = js_throw_error(env, NULL, "Unsupported operation: js_get_value_bigint_words");
+  assert(err == 0);
+
+  return js__error(env);
+}
+
+int
 js_get_value_string_utf8(js_env_t *env, js_value_t *value, utf8_t *str, size_t len, size_t *result) {
   // Allow continuing even with a pending exception
 
@@ -4059,12 +4213,62 @@ int
 js_get_filtered_property_names(js_env_t *env, js_value_t *object, js_key_collection_mode_t mode, js_property_filter_t property_filter, js_index_filter_t index_filter, js_key_conversion_mode_t key_conversion, js_value_t **result) {
   if (env->exception) return js__error(env);
 
-  int err;
+  // JSC's JSObjectCopyPropertyNames returns own enumerable string properties.
+  // This is a best-effort implementation that covers the common case.
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  env->depth++;
 
-  return js__error(env);
+  JSPropertyNameArrayRef properties = JSObjectCopyPropertyNames(env->context, (JSObjectRef) object);
+
+  env->depth--;
+
+  if (env->exception) return js__propagate_exception(env);
+
+  size_t count = JSPropertyNameArrayGetCount(properties);
+
+  JSValueRef argv[] = {JSValueMakeNumber(env->context, 0)};
+
+  JSObjectRef array = JSObjectMakeArray(env->context, 1, argv, &env->exception);
+
+  if (env->exception) goto err;
+
+  size_t j = 0;
+
+  for (size_t i = 0; i < count; i++) {
+    JSStringRef name = JSPropertyNameArrayGetNameAtIndex(properties, i);
+
+    if (index_filter == js_index_skip_indices) {
+      // Check if this property name looks like an array index
+      size_t name_len = JSStringGetLength(name);
+      const JSChar *chars = JSStringGetCharactersPtr(name);
+      bool is_index = name_len > 0;
+
+      for (size_t k = 0; k < name_len && is_index; k++) {
+        if (chars[k] < '0' || chars[k] > '9') is_index = false;
+      }
+
+      if (is_index) continue;
+    }
+
+    JSObjectSetPropertyAtIndex(env->context, array, (unsigned int) j++, JSValueMakeString(env->context, name), &env->exception);
+
+    if (env->exception) goto err;
+  }
+
+  JSPropertyNameArrayRelease(properties);
+
+  if (result) {
+    *result = (js_value_t *) array;
+
+    js__attach_to_handle_scope(env, env->scope, array);
+  }
+
+  return 0;
+
+err:
+  JSPropertyNameArrayRelease(properties);
+
+  return js__propagate_exception(env);
 }
 
 int
@@ -4429,12 +4633,23 @@ js_get_arraybuffer_info(js_env_t *env, js_value_t *arraybuffer, void **pdata, si
 // https://bugs.webkit.org/show_bug.cgi?id=257709
 int
 js_get_sharedarraybuffer_info(js_env_t *env, js_value_t *sharedarraybuffer, void **data, size_t *len) {
-  int err;
+  // Allow continuing even with a pending exception
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  JSValueRef exception = NULL;
 
-  return js__error(env);
+  if (data) {
+    *data = JSObjectGetArrayBufferBytesPtr(env->context, (JSObjectRef) sharedarraybuffer, &exception);
+
+    assert(exception == NULL);
+  }
+
+  if (len) {
+    *len = JSObjectGetArrayBufferByteLength(env->context, (JSObjectRef) sharedarraybuffer, &exception);
+
+    assert(exception == NULL);
+  }
+
+  return 0;
 }
 
 int
@@ -4646,54 +4861,296 @@ js_new_instance(js_env_t *env, js_value_t *constructor, size_t argc, js_value_t 
   return 0;
 }
 
-int
-js_create_threadsafe_function(js_env_t *env, js_value_t *function, size_t queue_limit, size_t initial_thread_count, js_finalize_cb finalize_cb, void *finalize_hint, void *context, js_threadsafe_function_cb cb, js_threadsafe_function_t **result) {
+// Threadsafe queue helpers
+
+static void
+js__threadsafe_queue_init(js_threadsafe_queue_t *queue) {
+  queue->queue = NULL;
+  queue->len = 0;
+  queue->capacity = 0;
+  queue->closed = false;
+  uv_mutex_init(&queue->lock);
+}
+
+static bool
+js__threadsafe_queue_push(js_threadsafe_queue_t *queue, void *data) {
+  uv_mutex_lock(&queue->lock);
+
+  if (queue->closed) {
+    uv_mutex_unlock(&queue->lock);
+    return false;
+  }
+
+  if (queue->len >= queue->capacity) {
+    if (queue->capacity) queue->capacity *= 2;
+    else queue->capacity = 4;
+
+    queue->queue = realloc(queue->queue, queue->capacity * sizeof(void *));
+  }
+
+  queue->queue[queue->len++] = data;
+
+  uv_mutex_unlock(&queue->lock);
+  return true;
+}
+
+static bool
+js__threadsafe_queue_pop(js_threadsafe_queue_t *queue, void **data) {
+  uv_mutex_lock(&queue->lock);
+
+  if (queue->len == 0) {
+    uv_mutex_unlock(&queue->lock);
+    return false;
+  }
+
+  *data = queue->queue[0];
+  queue->len--;
+
+  if (queue->len > 0) {
+    memmove(queue->queue, queue->queue + 1, queue->len * sizeof(void *));
+  }
+
+  uv_mutex_unlock(&queue->lock);
+  return true;
+}
+
+static void
+js__threadsafe_queue_close(js_threadsafe_queue_t *queue) {
+  uv_mutex_lock(&queue->lock);
+  queue->closed = true;
+  uv_mutex_unlock(&queue->lock);
+}
+
+static void
+js__threadsafe_queue_destroy(js_threadsafe_queue_t *queue) {
+  uv_mutex_destroy(&queue->lock);
+  if (queue->queue) free(queue->queue);
+}
+
+// Threadsafe function helpers
+
+static void js__threadsafe_function_signal(js_threadsafe_function_t *function);
+static void js__threadsafe_function_dispatch(js_threadsafe_function_t *function);
+
+static void
+js__threadsafe_function_default_cb(js_env_t *env, js_value_t *function, void *context, void *data) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  js_value_t *receiver;
+  err = js_get_undefined(env, &receiver);
   assert(err == 0);
 
-  return js__error(env);
+  js_call_function(env, receiver, function, 0, NULL, NULL);
+}
+
+static void
+js__threadsafe_function_on_close(uv_handle_t *handle) {
+  js_threadsafe_function_t *function = (js_threadsafe_function_t *) handle->data;
+
+  if (function->finalize_cb) {
+    function->finalize_cb(function->env, function->context, function->finalize_hint);
+  }
+
+  if (function->function) {
+    JSValueUnprotect(function->env->context, function->function);
+  }
+
+  js__threadsafe_queue_destroy(&function->queue);
+  free(function);
+}
+
+static bool
+js__threadsafe_function_call(js_threadsafe_function_t *function) {
+  void *data;
+
+  if (js__threadsafe_queue_pop(&function->queue, &data)) {
+    js_handle_scope_t *scope;
+    js_open_handle_scope(function->env, &scope);
+
+    js_value_t *fn = function->function ? (js_value_t *) function->function : NULL;
+    function->cb(function->env, fn, function->context, data);
+
+    js_close_handle_scope(function->env, scope);
+
+    return true;
+  }
+
+  if (atomic_load(&function->thread_count) == 0) {
+    uv_close((uv_handle_t *) &function->async, js__threadsafe_function_on_close);
+  }
+
+  return false;
+}
+
+static void
+js__threadsafe_function_signal(js_threadsafe_function_t *function) {
+  int state = atomic_fetch_or(&function->state, js_threadsafe_function_pending);
+
+  if (state & js_threadsafe_function_running) {
+    return;
+  }
+
+  int err = uv_async_send(&function->async);
+  assert(err == 0);
+}
+
+static void
+js__threadsafe_function_dispatch(js_threadsafe_function_t *function) {
+  bool done = false;
+  int iterations = 1024;
+
+  while (!done && --iterations >= 0) {
+    atomic_store(&function->state, js_threadsafe_function_running);
+
+    done = !js__threadsafe_function_call(function);
+
+    int prev = atomic_exchange(&function->state, js_threadsafe_function_idle);
+    if (prev != js_threadsafe_function_running) {
+      done = false;
+    }
+  }
+
+  if (!done) {
+    js__threadsafe_function_signal(function);
+  }
+}
+
+static void
+js__threadsafe_function_on_async(uv_async_t *handle) {
+  js_threadsafe_function_t *function = (js_threadsafe_function_t *) handle->data;
+
+  js__threadsafe_function_dispatch(function);
+}
+
+// Threadsafe function public API
+
+int
+js_create_threadsafe_function(js_env_t *env, js_value_t *function, size_t queue_limit, size_t initial_thread_count, js_finalize_cb finalize_cb, void *finalize_hint, void *context, js_threadsafe_function_cb cb, js_threadsafe_function_t **result) {
+  if (env->exception) return js__error(env);
+
+  int err;
+
+  if (function == NULL && cb == NULL) {
+    err = js_throw_error(env, NULL, "Either a function or a callback must be provided");
+    assert(err == 0);
+
+    return js__error(env);
+  }
+
+  if (initial_thread_count == 0) {
+    err = js_throw_error(env, NULL, "Initial thread count must be greater than 0");
+    assert(err == 0);
+
+    return js__error(env);
+  }
+
+  js_threadsafe_function_t *tsfn = malloc(sizeof(js_threadsafe_function_t));
+
+  tsfn->env = env;
+  tsfn->context = context;
+  tsfn->finalize_cb = finalize_cb;
+  tsfn->finalize_hint = finalize_hint;
+  tsfn->cb = cb ? cb : js__threadsafe_function_default_cb;
+
+  atomic_init(&tsfn->state, js_threadsafe_function_idle);
+  atomic_init(&tsfn->thread_count, (int) initial_thread_count);
+
+  js__threadsafe_queue_init(&tsfn->queue);
+
+  err = uv_async_init(env->loop, &tsfn->async, js__threadsafe_function_on_async);
+  assert(err == 0);
+
+  tsfn->async.data = tsfn;
+
+  if (function != NULL) {
+    tsfn->function = (JSObjectRef) function;
+    JSValueProtect(env->context, tsfn->function);
+  } else {
+    tsfn->function = NULL;
+  }
+
+  *result = tsfn;
+
+  return 0;
 }
 
 int
 js_get_threadsafe_function_context(js_threadsafe_function_t *function, void **result) {
-  return -1;
+  // Allow continuing even with a pending exception
+
+  *result = function->context;
+
+  return 0;
 }
 
 int
 js_call_threadsafe_function(js_threadsafe_function_t *function, void *data, js_threadsafe_function_call_mode_t mode) {
+  // Allow continuing even with a pending exception
+
+  if (atomic_load(&function->thread_count) == 0) return -1;
+
+  if (js__threadsafe_queue_push(&function->queue, data)) {
+    js__threadsafe_function_signal(function);
+    return 0;
+  }
+
   return -1;
 }
 
 int
 js_acquire_threadsafe_function(js_threadsafe_function_t *function) {
+  // Allow continuing even with a pending exception
+
+  int thread_count = atomic_load(&function->thread_count);
+
+  while (thread_count != 0) {
+    if (atomic_compare_exchange_weak(&function->thread_count, &thread_count, thread_count + 1)) {
+      return 0;
+    }
+  }
+
   return -1;
 }
 
 int
 js_release_threadsafe_function(js_threadsafe_function_t *function, js_threadsafe_function_release_mode_t mode) {
+  // Allow continuing even with a pending exception
+
+  bool abort = (mode == js_threadsafe_function_abort);
+  int thread_count = atomic_load(&function->thread_count);
+
+  while (thread_count != 0) {
+    int new_count = abort ? 0 : thread_count - 1;
+
+    if (atomic_compare_exchange_weak(&function->thread_count, &thread_count, new_count)) {
+      if (abort || thread_count == 1) {
+        js__threadsafe_queue_close(&function->queue);
+        js__threadsafe_function_signal(function);
+      }
+
+      return 0;
+    }
+  }
+
   return -1;
 }
 
 int
 js_ref_threadsafe_function(js_env_t *env, js_threadsafe_function_t *function) {
-  int err;
+  // Allow continuing even with a pending exception
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  uv_ref((uv_handle_t *) &function->async);
 
-  return js__error(env);
+  return 0;
 }
 
 int
 js_unref_threadsafe_function(js_env_t *env, js_threadsafe_function_t *function) {
-  int err;
+  // Allow continuing even with a pending exception
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
-  assert(err == 0);
+  uv_unref((uv_handle_t *) &function->async);
 
-  return js__error(env);
+  return 0;
 }
 
 int
@@ -5324,7 +5781,7 @@ int
 js_get_heap_statistics(js_env_t *env, js_heap_statistics_t *result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_get_heap_statistics");
   assert(err == 0);
 
   return js__error(env);
@@ -5341,7 +5798,7 @@ int
 js_create_inspector(js_env_t *env, js_inspector_t **result) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_create_inspector");
   assert(err == 0);
 
   return js__error(env);
@@ -5351,7 +5808,7 @@ int
 js_destroy_inspector(js_env_t *env, js_inspector_t *inspector) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_destroy_inspector");
   assert(err == 0);
 
   return js__error(env);
@@ -5376,7 +5833,7 @@ int
 js_connect_inspector(js_env_t *env, js_inspector_t *inspector) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_connect_inspector");
   assert(err == 0);
 
   return js__error(env);
@@ -5386,7 +5843,7 @@ int
 js_send_inspector_request(js_env_t *env, js_inspector_t *inspector, js_value_t *message) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_send_inspector_request");
   assert(err == 0);
 
   return js__error(env);
@@ -5396,7 +5853,7 @@ int
 js_send_inspector_request_transitional(js_env_t *env, js_inspector_t *inspector, const char *message, size_t len) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_send_inspector_request_transitional");
   assert(err == 0);
 
   return js__error(env);
@@ -5406,7 +5863,7 @@ int
 js_attach_context_to_inspector(js_env_t *env, js_inspector_t *inspector, js_context_t *context, const char *name, size_t len) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_attach_context_to_inspector");
   assert(err == 0);
 
   return js__error(env);
@@ -5416,7 +5873,7 @@ int
 js_detach_context_from_inspector(js_env_t *env, js_inspector_t *inspector, js_context_t *context) {
   int err;
 
-  err = js_throw_error(env, NULL, "Unsupported operation");
+  err = js_throw_error(env, NULL, "Unsupported operation: js_detach_context_from_inspector");
   assert(err == 0);
 
   return js__error(env);
