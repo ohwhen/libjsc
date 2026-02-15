@@ -88,6 +88,9 @@ struct js_module_s {
   size_t export_names_len;
   char **export_names_strs;
   JSObjectRef pending_exports; // Plain object holding export name→value pairs
+
+  // Cached module namespace, captured during js_run_module via import()
+  JSValueRef namespace_ref;
 };
 
 struct js_env_s {
@@ -1095,6 +1098,7 @@ js_create_module(js_env_t *env, const char *name, size_t len, int offset, js_val
   module->is_synthetic = false;
   module->jsc_script = NULL;
   module->pending_exports = NULL;
+  module->namespace_ref = NULL;
 
   module->callbacks.meta = cb;
   module->callbacks.meta_data = data;
@@ -1124,6 +1128,7 @@ js_create_synthetic_module(js_env_t *env, const char *name, size_t len, js_value
 
   module->is_synthetic = true;
   module->jsc_script = NULL;
+  module->namespace_ref = NULL;
 
   module->callbacks.evaluate = cb;
   module->callbacks.evaluate_data = data;
@@ -1190,6 +1195,10 @@ js_delete_module(js_env_t *env, js_module_t *module) {
     JSValueUnprotect(env->context, module->pending_exports);
   }
 
+  if (module->namespace_ref) {
+    JSValueUnprotect(env->context, module->namespace_ref);
+  }
+
   if (module->export_names_strs) {
     for (size_t i = 0; i < module->export_names_len; i++) {
       free(module->export_names_strs[i]);
@@ -1211,49 +1220,23 @@ int
 js_get_module_namespace(js_env_t *env, js_module_t *module, js_value_t **result) {
   if (env->exception) return js__error(env);
 
-  // Use dynamic import() to get the already-evaluated module's namespace.
-  // Since the module is cached by URL, this returns the cached namespace.
-  char code[1536];
-  snprintf(code, sizeof(code),
-    "globalThis.__jsc_ns = undefined; globalThis.__jsc_ns_err = undefined;"
-    "import('file:///bare-modules/%s').then("
-    "  function(ns) { globalThis.__jsc_ns = ns; },"
-    "  function(e) { globalThis.__jsc_ns_err = e; }"
-    ")", module->name);
-
-  JSStringRef code_str = JSStringCreateWithUTF8CString(code);
-  JSEvaluateScript(env->context, code_str, NULL, NULL, 0, NULL);
-  JSStringRelease(code_str);
-
-  // Drain microtasks
-  JSStringRef drain = JSStringCreateWithUTF8CString("0");
-  JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
-  JSStringRelease(drain);
-
-  JSObjectRef global = JSContextGetGlobalObject(env->context);
-  JSStringRef ns_key = JSStringCreateWithUTF8CString("__jsc_ns");
-  JSValueRef ns_val = JSObjectGetProperty(env->context, global, ns_key, NULL);
-  JSStringRelease(ns_key);
-
-  // Clean up
-  JSStringRef del1 = JSStringCreateWithUTF8CString("__jsc_ns");
-  JSObjectDeleteProperty(env->context, global, del1, NULL);
-  JSStringRelease(del1);
-
-  JSStringRef del2 = JSStringCreateWithUTF8CString("__jsc_ns_err");
-  JSObjectDeleteProperty(env->context, global, del2, NULL);
-  JSStringRelease(del2);
-
-  if (JSValueIsUndefined(env->context, ns_val)) {
-    int err = js_throw_error(env, NULL, "Failed to get module namespace");
-    assert(err == 0);
-    return js__error(env);
+  // The namespace was captured during js_run_module via import().then(ns => ...).
+  if (module->namespace_ref != NULL) {
+    *result = (js_value_t *) module->namespace_ref;
+    js__attach_to_handle_scope(env, env->scope, module->namespace_ref);
+    return 0;
   }
 
-  *result = (js_value_t *) ns_val;
-  js__attach_to_handle_scope(env, env->scope, ns_val);
+  // Fallback: for synthetic modules, use the pending_exports object as namespace
+  if (module->is_synthetic && module->pending_exports != NULL) {
+    *result = (js_value_t *) module->pending_exports;
+    js__attach_to_handle_scope(env, env->scope, (JSValueRef) module->pending_exports);
+    return 0;
+  }
 
-  return 0;
+  int err = js_throw_error(env, NULL, "Failed to get module namespace");
+  assert(err == 0);
+  return js__error(env);
 }
 
 int
@@ -1440,21 +1423,34 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSObjectSetProperty(env->context, global, mp_key, jsc_promise, 0, NULL);
   JSStringRelease(mp_key);
 
-  // Set up state tracking + drain microtasks
-  JSStringRef chain_code = JSStringCreateWithUTF8CString(
-    "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined;"
+  // Build the module URL for the namespace import
+  char mod_url[4096];
+  snprintf(mod_url, sizeof(mod_url), "file:///bare-modules/%s", module->name);
+
+  // Set up state tracking + namespace capture via import()
+  // The import() re-uses the already-evaluated module from JSC's cache,
+  // giving us the namespace object.
+  char chain_buf[8192];
+  snprintf(chain_buf, sizeof(chain_buf),
+    "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined; globalThis.__jsc_mns = undefined;"
     "__jsc_mp.then("
-    "  function(v) { globalThis.__jsc_ms = 1; globalThis.__jsc_mr = v; },"
+    "  function(v) {"
+    "    globalThis.__jsc_ms = 1; globalThis.__jsc_mr = v;"
+    "    return import('%s').then(function(ns) { globalThis.__jsc_mns = ns; });"
+    "  },"
     "  function(r) { globalThis.__jsc_ms = 2; globalThis.__jsc_mr = r; }"
-    ")");
+    ")", mod_url);
+  JSStringRef chain_code = JSStringCreateWithUTF8CString(chain_buf);
   JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
   JSStringRelease(chain_code);
 
-  // Drain microtasks to allow JSC to resolve imports via the delegate
-  // and process the promise chain.
-  JSStringRef drain = JSStringCreateWithUTF8CString("0");
-  JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
-  JSStringRelease(drain);
+  // Drain microtasks multiple times to allow the full promise chain
+  // (evaluation → import() → .then(ns)) to resolve.
+  for (int i = 0; i < 4; i++) {
+    JSStringRef drain = JSStringCreateWithUTF8CString("0");
+    JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
+    JSStringRelease(drain);
+  }
 
   // Read the state
   JSStringRef ms_key = JSStringCreateWithUTF8CString("__jsc_ms");
@@ -1465,6 +1461,16 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSStringRef mr_key = JSStringCreateWithUTF8CString("__jsc_mr");
   JSValueRef mr_val = JSObjectGetProperty(env->context, global, mr_key, NULL);
   JSStringRelease(mr_key);
+
+  // Capture the module namespace from the import() chain
+  JSStringRef mns_key = JSStringCreateWithUTF8CString("__jsc_mns");
+  JSValueRef mns_val = JSObjectGetProperty(env->context, global, mns_key, NULL);
+  JSStringRelease(mns_key);
+
+  if (!JSValueIsUndefined(env->context, mns_val) && !JSValueIsNull(env->context, mns_val)) {
+    module->namespace_ref = mns_val;
+    JSValueProtect(env->context, module->namespace_ref);
+  }
 
   // Create a tracked deferred promise with __ps set
   JSObjectRef resolve_fn, reject_fn;
@@ -1509,6 +1515,10 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSStringRef del3 = JSStringCreateWithUTF8CString("__jsc_mr");
   JSObjectDeleteProperty(env->context, global, del3, NULL);
   JSStringRelease(del3);
+
+  JSStringRef del4 = JSStringCreateWithUTF8CString("__jsc_mns");
+  JSObjectDeleteProperty(env->context, global, del4, NULL);
+  JSStringRelease(del4);
 
   *result = (js_value_t *) tracked;
 
