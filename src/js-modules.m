@@ -138,10 +138,16 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   // same call stack, recursively triggering more delegate calls. With 200+
   // modules, this causes "Maximum call stack size exceeded".
   // By deferring, each module resolution happens in a flat call stack.
+  //
+  // We use CFRunLoopPerformBlock (not dispatch_async) because the drain loop
+  // in js_run_module uses nested NSRunLoop runMode: calls. dispatch_async to
+  // the main queue may not be serviceable from nested run loop invocations,
+  // but CFRunLoopPerformBlock schedules directly on the run loop.
   JSScript *s = (__bridge JSScript *)script;
-  dispatch_async(dispatch_get_main_queue(), ^{
+  CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopDefaultMode, ^{
     [resolve callWithArguments:@[s]];
   });
+  CFRunLoopWakeUp(CFRunLoopGetMain());
 }
 
 @end
