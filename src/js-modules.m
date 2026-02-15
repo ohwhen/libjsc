@@ -353,12 +353,21 @@ js__resolve_lock_symbols(void) {
   if (s_lock_resolved) return;
   s_lock_resolved = true;
 
-  // Open JavaScriptCore framework explicitly — RTLD_DEFAULT doesn't find
-  // internal symbols when the framework is in the dyld shared cache (iOS).
-  // RTLD_NOLOAD: don't load, just get handle to already-loaded image.
-  void *jsc_handle = dlopen(
-    "/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore",
-    RTLD_NOLOAD);
+  // Find the actual loaded JavaScriptCore image. On the iOS simulator the
+  // framework is loaded from the simulator runtime root, NOT from
+  // /System/Library/Frameworks/..., so a hardcoded path won't work.
+  //
+  // Strategy: use dladdr() on a known public JSC symbol (JSEvaluateScript)
+  // to discover the actual image path, then dlopen() that path.
+  Dl_info info;
+  if (!dladdr((void *)JSEvaluateScript, &info) || !info.dli_fname) {
+    NSLog(@"[libjsc] provideFetch: dladdr failed for JSEvaluateScript");
+    return;
+  }
+
+  NSLog(@"[libjsc] provideFetch: JSC image at %s", info.dli_fname);
+
+  void *jsc_handle = dlopen(info.dli_fname, RTLD_NOLOAD);
 
   if (!jsc_handle) {
     NSLog(@"[libjsc] provideFetch: dlopen JSC failed: %s", dlerror());
