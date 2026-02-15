@@ -61,4 +61,10 @@ js__objc_get_context_ref(void *objc_context);
 void
 js__nslog(const char *msg);
 
+// Process pending run loop sources. JSC's module loader dispatches
+// dependency resolution via the run loop, not the microtask queue.
+// Returns 1 if a source was handled, 0 otherwise.
+int
+js__drain_run_loop(void);
+
 #endif // JS_MODULES_H

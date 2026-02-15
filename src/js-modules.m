@@ -147,6 +147,17 @@ js__nslog(const char *msg) {
   NSLog(@"[libjsc] %s", msg);
 }
 
+int
+js__drain_run_loop(void) {
+  // Process one pending run loop source. JSC's module loader dispatches
+  // dependency resolution callbacks via the run loop, so we must spin it
+  // to trigger delegate calls during synchronous drain loops.
+  BOOL handled = [[NSRunLoop currentRunLoop]
+    runMode:NSDefaultRunLoopMode
+    beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.001]];
+  return handled ? 1 : 0;
+}
+
 void *
 js__objc_context_create(JSGlobalContextRef *out_ctx, JSContextGroupRef *out_group) {
   JSContext *ctx = [[JSContext alloc] init];

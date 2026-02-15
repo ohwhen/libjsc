@@ -1608,14 +1608,15 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   JSEvaluateScript(env->context, import_code, NULL, NULL, 0, NULL);
   JSStringRelease(import_code);
 
-  // Drain microtasks in a loop until the import() promise resolves.
-  // Each JSEvaluateScript call implicitly drains the microtask queue,
-  // which triggers JSC's internal module resolution (delegate calls).
-  // Deep module trees require many drain cycles — one per dependency level.
+  // Drain microtasks AND the run loop until the import() promise resolves.
+  // JSC dispatches module dependency resolution via the run loop, not the
+  // microtask queue. Each iteration: process run loop sources (triggers
+  // delegate calls), then drain microtasks (resolves promises).
   JSStringRef check = JSStringCreateWithUTF8CString("globalThis.__jsc_ms");
   int state = 0;
   int iterations = 0;
   for (; iterations < 10000 && state == 0; iterations++) {
+    js__drain_run_loop();
     JSValueRef val = JSEvaluateScript(env->context, check, NULL, NULL, 0, NULL);
     state = (int) JSValueToNumber(env->context, val, NULL);
   }
