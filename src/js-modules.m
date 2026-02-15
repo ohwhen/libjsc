@@ -353,19 +353,31 @@ js__resolve_lock_symbols(void) {
   if (s_lock_resolved) return;
   s_lock_resolved = true;
 
+  // Open JavaScriptCore framework explicitly — RTLD_DEFAULT doesn't find
+  // internal symbols when the framework is in the dyld shared cache (iOS).
+  // RTLD_NOLOAD: don't load, just get handle to already-loaded image.
+  void *jsc_handle = dlopen(
+    "/System/Library/Frameworks/JavaScriptCore.framework/JavaScriptCore",
+    RTLD_NOLOAD);
+
+  if (!jsc_handle) {
+    NSLog(@"[libjsc] provideFetch: dlopen JSC failed: %s", dlerror());
+    return;
+  }
+
   // JSC::JSLockHolder::JSLockHolder(JSC::JSGlobalObject*)
-  s_lock_ctor = (js__lock_ctor_fn)dlsym(RTLD_DEFAULT,
+  s_lock_ctor = (js__lock_ctor_fn)dlsym(jsc_handle,
     "__ZN3JSC12JSLockHolderC1EPNS_14JSGlobalObjectE");
 
   // JSC::JSLockHolder::~JSLockHolder()
-  s_lock_dtor = (js__lock_dtor_fn)dlsym(RTLD_DEFAULT,
+  s_lock_dtor = (js__lock_dtor_fn)dlsym(jsc_handle,
     "__ZN3JSC12JSLockHolderD1Ev");
 
   if (s_lock_ctor && s_lock_dtor) {
     NSLog(@"[libjsc] provideFetch: JSLockHolder resolved via dlsym");
   } else {
-    NSLog(@"[libjsc] provideFetch: JSLockHolder NOT found (ctor=%p dtor=%p)",
-          s_lock_ctor, s_lock_dtor);
+    NSLog(@"[libjsc] provideFetch: JSLockHolder NOT found (ctor=%p dtor=%p, err=%s)",
+          s_lock_ctor, s_lock_dtor, dlerror());
   }
 }
 
