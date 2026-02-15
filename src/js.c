@@ -962,6 +962,13 @@ js__close_env(js_env_t *env) {
   env->module_eval_count = 0;
 
   js__module_delegate_release(env->module_loader_delegate);
+
+  // NULL out context BEFORE releasing the Obj-C context. The release
+  // triggers JSVirtualMachine dealloc → lastChanceToFinalize → GC sweep,
+  // which destroys external objects via js__on_external_finalize →
+  // js_delete_module. That function checks env->context to guard against
+  // calling JSValueUnprotect on a dead context.
+  env->context = NULL;
   js__objc_context_release(env->objc_context);
 
   uv_close((uv_handle_t *) &env->teardown, js__on_handle_close);
@@ -1442,12 +1449,19 @@ js_delete_module(js_env_t *env, js_module_t *module) {
     js__module_script_release(module->jsc_script);
   }
 
-  if (module->pending_exports) {
-    JSValueUnprotect(env->context, module->pending_exports);
-  }
+  // Guard: during VM teardown (lastChanceToFinalize), the GC sweeps
+  // callback objects which triggers js__on_external_finalize → js_delete_module.
+  // By this point the JSContext/JSGlobalContext may already be destroyed.
+  // Calling JSValueUnprotect on a dead context causes EXC_BAD_ACCESS.
+  // Check both env->context and env->destroying to be safe.
+  if (env->context != NULL && !env->destroying) {
+    if (module->pending_exports) {
+      JSValueUnprotect(env->context, module->pending_exports);
+    }
 
-  if (module->namespace_ref) {
-    JSValueUnprotect(env->context, module->namespace_ref);
+    if (module->namespace_ref) {
+      JSValueUnprotect(env->context, module->namespace_ref);
+    }
   }
 
   if (module->export_names_strs) {
@@ -1765,10 +1779,14 @@ js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb c
 int
 js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   { char logbuf[512]; snprintf(logbuf, sizeof(logbuf),
-    "js_run_module: name='%s' instantiate_depth=%u",
-    module->name ? module->name : "(null)", env->instantiate_depth);
+    "js_run_module: name='%s' instantiate_depth=%u jsc_script=%p",
+    module->name ? module->name : "(null)", env->instantiate_depth,
+    module->jsc_script);
     js__nslog(logbuf); }
-  if (env->exception) return js__error(env);
+  if (env->exception) {
+    js__nslog("js_run_module: ERROR env->exception already set on entry!");
+    return js__error(env);
+  }
 
   // When called recursively from _onimport → Module.load() → binding.runModule()
   // during another module's instantiation, skip evaluation. The top-level
@@ -1788,6 +1806,10 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   }
 
   if (module->jsc_script == NULL) {
+    { char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
+      "js_run_module: ERROR jsc_script==NULL for '%s'",
+      module->name ? module->name : "(null)");
+      js__nslog(logbuf); }
     int err = js_throw_error(env, NULL, "Module not instantiated");
     assert(err == 0);
     return js__error(env);
@@ -1884,7 +1906,23 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   }
 
   if (eval_result == NULL) {
-    if (env->exception) return js__propagate_exception(env);
+    { char logbuf[256]; snprintf(logbuf, sizeof(logbuf),
+      "js_run_module: ERROR evaluateJSScript returned NULL for '%s' (exception=%d)",
+      module->name ? module->name : "(null)", env->exception != NULL);
+      js__nslog(logbuf); }
+    if (env->exception) {
+      // Log the exception message
+      JSStringRef exc_str = JSValueToStringCopy(env->context, env->exception, NULL);
+      if (exc_str) {
+        char exc_buf[512];
+        JSStringGetUTF8CString(exc_str, exc_buf, sizeof(exc_buf));
+        JSStringRelease(exc_str);
+        { char logbuf2[768]; snprintf(logbuf2, sizeof(logbuf2),
+          "js_run_module: exception='%.500s'", exc_buf);
+          js__nslog(logbuf2); }
+      }
+      return js__propagate_exception(env);
+    }
 
     int err = js_throw_error(env, NULL, "Module evaluation returned NULL");
     assert(err == 0);
