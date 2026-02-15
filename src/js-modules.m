@@ -48,6 +48,7 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   NSMutableDictionary<NSString *, NSValue *> *moduleRegistry;
   NSMutableArray *pendingResolutions;  // Queue of deferred resolve blocks
   int resolveCount;    // Total synchronous resolves in current batch
+  BOOL isDraining;     // Prevents nested drain loops
 }
 @end
 
@@ -157,10 +158,27 @@ static const int kMaxResolveBatch = 50;
     resolveCount++;
     [resolve callWithArguments:@[s]];
   } else {
-    // Queue for later processing by js__module_delegate_drain_one
+    // Queue for deferred processing
     [pendingResolutions addObject:[^{
       [resolve callWithArguments:@[s]];
     } copy]];
+
+    // Self-drain: if we're the outermost delegate that triggered queueing,
+    // process the queue iteratively at THIS stack depth. Each item resets
+    // resolveCount and triggers up to kMaxResolveBatch synchronous resolves.
+    // Nested delegate calls that exceed the batch limit just queue (isDraining
+    // prevents re-entering the while loop), keeping max stack depth bounded
+    // to ~2 * kMaxResolveBatch levels.
+    if (!isDraining) {
+      isDraining = YES;
+      while (pendingResolutions.count > 0) {
+        resolveCount = 0;
+        void (^block)(void) = pendingResolutions[0];
+        [pendingResolutions removeObjectAtIndex:0];
+        block();
+      }
+      isDraining = NO;
+    }
   }
 }
 

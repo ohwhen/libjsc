@@ -1760,11 +1760,21 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
     // and resolves it — which may trigger up to kMaxResolveBatch more
     // synchronous resolutions before queuing again. drain_run_loop
     // processes any pending run loop sources JSC needs.
+    //
+    // On iOS (reentrancy guard active), module evaluation is deferred
+    // until the JS call stack unwinds. The drain loop won't resolve
+    // modules here — break early if nothing is happening.
     int iterations = 0;
+    int idle = 0;
     for (; iterations < 5000 && state == 0; iterations++) {
-      js__module_delegate_drain_one(env->module_loader_delegate);
+      int drained = js__module_delegate_drain_one(env->module_loader_delegate);
       js__drain_run_loop();
       state = js__objc_eval_int(env->objc_context, "globalThis.__jsc_ms");
+      if (!drained && state == 0) {
+        if (++idle >= 10) break;  // Nothing happening, don't wait
+      } else {
+        idle = 0;
+      }
     }
 
     {
