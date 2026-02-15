@@ -255,7 +255,7 @@ js_create_platform(uv_loop_t *loop, const js_platform_options_t *options, js_pla
   // module resolution chains. Setting this higher lets JSC use more of
   // the available thread stack when the thread is created with a larger
   // stack (e.g. via pthread_attr_setstacksize or worklet thread config).
-  err = uv_os_setenv("JSC_maxPerThreadStackUsage", "16777216");
+  err = uv_os_setenv("JSC_maxPerThreadStackUsage", "67108864");
   assert(err == 0);
 
   // Reduce reserved zone sizes to leave more usable stack space.
