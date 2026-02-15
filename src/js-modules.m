@@ -46,8 +46,14 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   @public
   js_env_t *env;
   NSMutableDictionary<NSString *, NSValue *> *moduleRegistry;
+  int resolveDepth;  // Current synchronous resolution depth
 }
 @end
+
+// Maximum depth of synchronous delegate resolution before deferring.
+// JSC's default JS stack is ~10K frames. Each module resolution adds ~5-10
+// frames. Limit to 30 levels to leave headroom for module evaluation code.
+static const int kMaxResolveDepth = 30;
 
 @implementation JSCModuleDelegate
 
@@ -55,6 +61,7 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
   self = [super init];
   if (self) {
     moduleRegistry = [[NSMutableDictionary alloc] init];
+    resolveDepth = 0;
   }
   return self;
 }
@@ -133,21 +140,29 @@ static NSString *const kModuleURLPrefix = @"file:///bare-modules/";
     }
   }
 
-  // Defer resolution to the next run loop iteration.
-  // Without this, JSC immediately evaluates the resolved module within the
-  // same call stack, recursively triggering more delegate calls. With 200+
-  // modules, this causes "Maximum call stack size exceeded".
-  // By deferring, each module resolution happens in a flat call stack.
+  // Trampoline: resolve synchronously up to kMaxResolveDepth levels.
+  // When JSC resolves a module, it immediately evaluates it, triggering more
+  // delegate calls for that module's imports — creating deep recursion.
+  // With 200+ modules this causes "Maximum call stack size exceeded".
   //
-  // We use CFRunLoopPerformBlock (not dispatch_async) because the drain loop
-  // in js_run_module uses nested NSRunLoop runMode: calls. dispatch_async to
-  // the main queue may not be serviceable from nested run loop invocations,
-  // but CFRunLoopPerformBlock schedules directly on the run loop.
+  // We allow up to kMaxResolveDepth levels of synchronous resolution (which
+  // is fast and stays within stack limits), then defer to the next run loop
+  // iteration. When the deferred blocks fire, resolveDepth resets to 0,
+  // allowing another kMaxResolveDepth levels.
   JSScript *s = (__bridge JSScript *)script;
-  CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopDefaultMode, ^{
+
+  if (resolveDepth < kMaxResolveDepth) {
+    resolveDepth++;
     [resolve callWithArguments:@[s]];
-  });
-  CFRunLoopWakeUp(CFRunLoopGetMain());
+    resolveDepth--;
+  } else {
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopDefaultMode, ^{
+      self->resolveDepth++;
+      [resolve callWithArguments:@[s]];
+      self->resolveDepth--;
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+  }
 }
 
 @end
