@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 4.0)
 
 find_package(cmake-fetch REQUIRED PATHS node_modules/cmake-fetch)
 
-project(js C)
+project(js C OBJC)
 
 add_library(js OBJECT)
 
@@ -20,6 +20,8 @@ target_sources(
   js
   PRIVATE
     src/js.c
+    src/js-modules.m
+    src/js-modules.h
     src/jsc.h
     src/jsc/JSBasePrivate.h
     src/jsc/JSContextRefPrivate.h
@@ -50,7 +52,10 @@ target_link_libraries(
   PUBLIC
     "-framework CoreFoundation"
     "-framework JavaScriptCore"
+    "-framework Foundation"
 )
+
+set_source_files_properties(src/js-modules.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 
 add_library(js_shared SHARED)
 

@@ -226,20 +226,16 @@ list(APPEND skipped_tests
   create-sharedarraybuffer
   create-sharedarraybuffer-with-backing-store
 
-  # https://bugs.webkit.org/show_bug.cgi?id=261600
-  create-module-import-missing
+  # https://bugs.webkit.org/show_bug.cgi?id=261600 (partially implemented via Obj-C API)
+  # Phase 2: still skipped
   dynamic-import
   dynamic-import-with-promise
   dynamic-import-without-handler
   import-meta
   import-meta-throw
-  run-module
   run-module-async
   run-module-cyclic-import
-  run-module-nested-import
-  run-module-double-nested-import
   run-module-in-context
-  run-module-throw
 
   # https://bugs.webkit.org/show_bug.cgi?id=250552
   create-external-arraybuffer-with-finalizer-detach

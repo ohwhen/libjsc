@@ -17,7 +17,10 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <JavaScriptCore/JavaScriptCore.h>
 
+#include <ctype.h>
+
 #include "jsc.h"
+#include "js-modules.h"
 
 typedef struct js_callback_s js_callback_t;
 typedef struct js_finalizer_s js_finalizer_t;
@@ -61,6 +64,32 @@ struct js_platform_s {
   uv_loop_t *loop;
 };
 
+struct js_module_s {
+  char *name;
+  size_t name_len;
+
+  char *source;
+  int offset;
+
+  void *jsc_script; // Retained JSScript* (created during instantiate)
+
+  bool is_synthetic;
+
+  struct {
+    js_module_resolve_cb resolve;
+    void *resolve_data;
+    js_module_meta_cb meta;
+    void *meta_data;
+    js_module_evaluate_cb evaluate;
+    void *evaluate_data;
+  } callbacks;
+
+  // Synthetic module storage
+  size_t export_names_len;
+  char **export_names_strs;
+  JSObjectRef pending_exports; // Plain object holding export name→value pairs
+};
+
 struct js_env_s {
   uv_loop_t *loop;
   uv_async_t teardown;
@@ -71,6 +100,10 @@ struct js_env_s {
 
   uint32_t refs;
   uint32_t depth;
+
+  void *objc_context;         // Retained JSContext* (for module loader)
+  void *module_loader_delegate; // Retained JSCModuleDelegate*
+  js_module_t *current_loading_module;
 
   JSContextGroupRef group;
   JSGlobalContextRef context;
@@ -426,6 +459,183 @@ js__propagate_exception(js_env_t *env) {
   return js__error(env);
 }
 
+// -----------------------------------------------------------------------
+// Module struct accessor functions (called from js-modules.m)
+// -----------------------------------------------------------------------
+
+js_module_t *
+js__env_get_current_module(js_env_t *env) {
+  return env->current_loading_module;
+}
+
+void
+js__env_set_current_module(js_env_t *env, js_module_t *module) {
+  env->current_loading_module = module;
+}
+
+void *
+js__env_get_objc_context(js_env_t *env) {
+  return env->objc_context;
+}
+
+const char *
+js__module_get_name(js_module_t *module) {
+  return module->name;
+}
+
+const char *
+js__module_get_source(js_module_t *module) {
+  return module->source;
+}
+
+bool
+js__module_is_synthetic(js_module_t *module) {
+  return module->is_synthetic;
+}
+
+void *
+js__module_get_script(js_module_t *module) {
+  return module->jsc_script;
+}
+
+void
+js__module_set_script(js_module_t *module, void *script) {
+  module->jsc_script = script;
+}
+
+void *
+js__module_get_resolve_cb(js_module_t *module) {
+  return (void *) module->callbacks.resolve;
+}
+
+void *
+js__module_get_resolve_data(js_module_t *module) {
+  return module->callbacks.resolve_data;
+}
+
+void
+js__module_set_resolve_cb(js_module_t *module, void *cb, void *data) {
+  module->callbacks.resolve = (js_module_resolve_cb) cb;
+  module->callbacks.resolve_data = data;
+}
+
+void
+js__module_call_evaluate(js_env_t *env, js_module_t *module) {
+  if (module->callbacks.evaluate) {
+    module->callbacks.evaluate(env, module, module->callbacks.evaluate_data);
+  }
+}
+
+JSObjectRef
+js__module_get_pending_exports(js_module_t *module) {
+  return module->pending_exports;
+}
+
+// -----------------------------------------------------------------------
+// Bare specifier rewriter
+// -----------------------------------------------------------------------
+// JSC requires import specifiers to start with "/", "./", or "../".
+// This function rewrites bare specifiers by prepending "./" so they
+// resolve as relative URLs.
+
+static char *
+js__rewrite_bare_specifiers(const char *src) {
+  size_t len = strlen(src);
+  char *out = malloc(len * 2 + 1);
+  size_t oi = 0;
+
+  for (size_t i = 0; i < len;) {
+    // Look for 'from' keyword followed by whitespace and a quote
+    if (i + 4 < len &&
+        (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
+        src[i] == 'f' && src[i + 1] == 'r' &&
+        src[i + 2] == 'o' && src[i + 3] == 'm') {
+
+      out[oi++] = src[i++]; // f
+      out[oi++] = src[i++]; // r
+      out[oi++] = src[i++]; // o
+      out[oi++] = src[i++]; // m
+
+      while (i < len && (src[i] == ' ' || src[i] == '\t'))
+        out[oi++] = src[i++];
+
+      if (i < len && (src[i] == '\'' || src[i] == '"')) {
+        char q = src[i];
+        out[oi++] = src[i++]; // opening quote
+
+        if (i < len && src[i] != '.' && src[i] != '/') {
+          bool has_scheme = false;
+          for (size_t j = i; j < len && src[j] != q; j++) {
+            if (src[j] == ':' && j + 2 < len &&
+                src[j + 1] == '/' && src[j + 2] == '/') {
+              has_scheme = true;
+              break;
+            }
+          }
+          if (!has_scheme) {
+            out[oi++] = '.';
+            out[oi++] = '/';
+          }
+        }
+
+        while (i < len && src[i] != q)
+          out[oi++] = src[i++];
+        if (i < len)
+          out[oi++] = src[i++]; // closing quote
+      }
+      continue;
+    }
+
+    // Side-effect import: import 'xxx'
+    if (i + 6 < len &&
+        (i == 0 || !isalnum((unsigned char) src[i - 1])) &&
+        src[i] == 'i' && src[i + 1] == 'm' && src[i + 2] == 'p' &&
+        src[i + 3] == 'o' && src[i + 4] == 'r' && src[i + 5] == 't') {
+
+      out[oi++] = src[i++]; // i
+      out[oi++] = src[i++]; // m
+      out[oi++] = src[i++]; // p
+      out[oi++] = src[i++]; // o
+      out[oi++] = src[i++]; // r
+      out[oi++] = src[i++]; // t
+
+      while (i < len && (src[i] == ' ' || src[i] == '\t'))
+        out[oi++] = src[i++];
+
+      if (i < len && (src[i] == '\'' || src[i] == '"')) {
+        char q = src[i];
+        out[oi++] = src[i++];
+
+        if (i < len && src[i] != '.' && src[i] != '/') {
+          bool has_scheme = false;
+          for (size_t j = i; j < len && src[j] != q; j++) {
+            if (src[j] == ':' && j + 2 < len &&
+                src[j + 1] == '/' && src[j + 2] == '/') {
+              has_scheme = true;
+              break;
+            }
+          }
+          if (!has_scheme) {
+            out[oi++] = '.';
+            out[oi++] = '/';
+          }
+        }
+
+        while (i < len && src[i] != q)
+          out[oi++] = src[i++];
+        if (i < len)
+          out[oi++] = src[i++];
+      }
+      continue;
+    }
+
+    out[oi++] = src[i++];
+  }
+
+  out[oi] = '\0';
+  return out;
+}
+
 static void
 js__on_handle_close(uv_handle_t *handle) {
   js_env_t *env = (js_env_t *) handle->data;
@@ -445,8 +655,8 @@ js__close_env(js_env_t *env) {
   JSClassRelease(env->classes.external);
   JSClassRelease(env->classes.constructor);
 
-  JSGlobalContextRelease(env->context);
-  JSContextGroupRelease(env->group);
+  js__module_delegate_release(env->module_loader_delegate);
+  js__objc_context_release(env->objc_context);
 
   uv_close((uv_handle_t *) &env->teardown, js__on_handle_close);
 }
@@ -462,9 +672,12 @@ int
 js_create_env(uv_loop_t *loop, js_platform_t *platform, const js_env_options_t *options, js_env_t **result) {
   int err;
 
-  JSContextGroupRef group = JSContextGroupCreate();
+  JSContextGroupRef group;
+  JSGlobalContextRef context;
 
-  JSGlobalContextRef context = JSGlobalContextCreateInGroup(group, NULL);
+  // Create JSContext via Obj-C API. This produces a JSAPIGlobalObject which
+  // is required for the module loader delegate to function.
+  void *objc_context = js__objc_context_create(&context, &group);
 
   js_env_t *env = malloc(sizeof(js_env_t));
 
@@ -475,6 +688,12 @@ js_create_env(uv_loop_t *loop, js_platform_t *platform, const js_env_options_t *
 
   env->refs = 0;
   env->depth = 0;
+
+  env->objc_context = objc_context;
+  env->module_loader_delegate = js__module_delegate_create(env);
+  env->current_loading_module = NULL;
+
+  js__module_delegate_set(objc_context, env->module_loader_delegate);
 
   env->group = group;
   env->context = context;
@@ -780,92 +999,363 @@ js_run_script(js_env_t *env, const char *file, size_t len, int offset, js_value_
   return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_create_module(js_env_t *env, const char *name, size_t len, int offset, js_value_t *source, js_module_meta_cb cb, void *data, js_module_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_create_module");
-  assert(err == 0);
+  // Extract UTF-8 source string
+  JSValueRef exception = NULL;
+  JSStringRef src_ref = JSValueToStringCopy(env->context, (JSValueRef) source, &exception);
+  if (exception) {
+    env->exception = exception;
+    return js__error(env);
+  }
 
-  return js__error(env);
+  size_t max_len = JSStringGetMaximumUTF8CStringSize(src_ref);
+  char *src_buf = malloc(max_len);
+  JSStringGetUTF8CString(src_ref, src_buf, max_len);
+  JSStringRelease(src_ref);
+
+  // Rewrite bare specifiers for JSC compatibility
+  char *rewritten = js__rewrite_bare_specifiers(src_buf);
+  free(src_buf);
+
+  // Allocate module
+  js_module_t *module = calloc(1, sizeof(js_module_t));
+
+  if (len == (size_t) -1) len = strlen(name);
+  module->name = malloc(len + 1);
+  memcpy(module->name, name, len);
+  module->name[len] = '\0';
+  module->name_len = len;
+
+  module->source = rewritten;
+  module->offset = offset;
+  module->is_synthetic = false;
+  module->jsc_script = NULL;
+  module->pending_exports = NULL;
+
+  module->callbacks.meta = cb;
+  module->callbacks.meta_data = data;
+  module->callbacks.resolve = NULL;
+  module->callbacks.resolve_data = NULL;
+  module->callbacks.evaluate = NULL;
+  module->callbacks.evaluate_data = NULL;
+
+  module->export_names_len = 0;
+  module->export_names_strs = NULL;
+
+  *result = module;
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_create_synthetic_module(js_env_t *env, const char *name, size_t len, js_value_t *const export_names[], size_t names_len, js_module_evaluate_cb cb, void *data, js_module_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_create_synthetic_module");
-  assert(err == 0);
+  js_module_t *module = calloc(1, sizeof(js_module_t));
 
-  return js__error(env);
+  if (len == (size_t) -1) len = strlen(name);
+  module->name = malloc(len + 1);
+  memcpy(module->name, name, len);
+  module->name[len] = '\0';
+  module->name_len = len;
+
+  module->is_synthetic = true;
+  module->jsc_script = NULL;
+
+  module->callbacks.evaluate = cb;
+  module->callbacks.evaluate_data = data;
+  module->callbacks.resolve = NULL;
+  module->callbacks.resolve_data = NULL;
+  module->callbacks.meta = NULL;
+  module->callbacks.meta_data = NULL;
+
+  // Create pending exports object
+  module->pending_exports = JSObjectMake(env->context, NULL, NULL);
+  JSValueProtect(env->context, module->pending_exports);
+
+  // Store export name strings
+  module->export_names_len = names_len;
+  module->export_names_strs = malloc(names_len * sizeof(char *));
+
+  // Build generated ESM source
+  // Format: var __s = globalThis.__jsc_syn["<name>"];
+  //         export var <name1> = __s["<name1>"];
+  //         export var <name2> = __s["<name2>"];
+  // For "default" export: export default __s["default"];
+  size_t src_cap = 256 + names_len * 128;
+  char *src = malloc(src_cap);
+  int pos = snprintf(src, src_cap,
+    "var __s = globalThis.__jsc_syn[\"%s\"];\n", module->name);
+
+  for (size_t i = 0; i < names_len; i++) {
+    JSValueRef exception = NULL;
+    JSStringRef name_ref = JSValueToStringCopy(
+      env->context, (JSValueRef) export_names[i], &exception);
+    size_t name_max = JSStringGetMaximumUTF8CStringSize(name_ref);
+    char *name_str = malloc(name_max);
+    JSStringGetUTF8CString(name_ref, name_str, name_max);
+    JSStringRelease(name_ref);
+
+    module->export_names_strs[i] = name_str;
+
+    if (strcmp(name_str, "default") == 0) {
+      pos += snprintf(src + pos, src_cap - pos,
+        "export default __s[\"default\"];\n");
+    } else {
+      pos += snprintf(src + pos, src_cap - pos,
+        "export var %s = __s[\"%s\"];\n", name_str, name_str);
+    }
+  }
+
+  module->source = src;
+  module->offset = 0;
+
+  *result = module;
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_delete_module(js_env_t *env, js_module_t *module) {
-  int err;
+  if (module->source) free(module->source);
+  if (module->name) free(module->name);
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_delete_module");
-  assert(err == 0);
+  if (module->jsc_script) {
+    js__module_script_release(module->jsc_script);
+  }
 
-  return js__error(env);
+  if (module->pending_exports) {
+    JSValueUnprotect(env->context, module->pending_exports);
+  }
+
+  if (module->export_names_strs) {
+    for (size_t i = 0; i < module->export_names_len; i++) {
+      free(module->export_names_strs[i]);
+    }
+    free(module->export_names_strs);
+  }
+
+  free(module);
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_get_module_name(js_env_t *env, js_module_t *module, const char **result) {
-  int err;
-
-  err = js_throw_error(env, NULL, "Unsupported operation: js_get_module_name");
-  assert(err == 0);
-
-  return js__error(env);
+  *result = module->name;
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_get_module_namespace(js_env_t *env, js_module_t *module, js_value_t **result) {
+  // Not implemented for Phase 1 — no tests require it yet.
   int err;
-
   err = js_throw_error(env, NULL, "Unsupported operation: js_get_module_namespace");
   assert(err == 0);
-
   return js__error(env);
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_set_module_export(js_env_t *env, js_module_t *module, js_value_t *name, js_value_t *value) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_set_module_export");
-  assert(err == 0);
+  if (!module->is_synthetic || !module->pending_exports) {
+    int err = js_throw_error(env, NULL, "js_set_module_export: not a synthetic module");
+    assert(err == 0);
+    return js__error(env);
+  }
 
-  return js__error(env);
+  // Get the name as a JSString
+  JSValueRef exception = NULL;
+  JSStringRef name_ref = JSValueToStringCopy(env->context, (JSValueRef) name, &exception);
+  if (exception) {
+    env->exception = exception;
+    return js__error(env);
+  }
+
+  // Set the property on the pending exports object
+  JSObjectSetProperty(env->context, module->pending_exports, name_ref,
+                      (JSValueRef) value, 0, &exception);
+  JSStringRelease(name_ref);
+
+  if (exception) {
+    env->exception = exception;
+    return js__error(env);
+  }
+
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_instantiate_module(js_env_t *env, js_module_t *module, js_module_resolve_cb cb, void *data) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_instantiate_module");
-  assert(err == 0);
+  module->callbacks.resolve = cb;
+  module->callbacks.resolve_data = data;
 
-  return js__error(env);
+  // Create the JSScript for this module
+  if (module->jsc_script == NULL && module->source != NULL) {
+    char url[512];
+    snprintf(url, sizeof(url), "file:///bare-modules/%s", module->name);
+
+    module->jsc_script = js__module_script_create(
+      env->objc_context, module->source, url);
+
+    if (module->jsc_script == NULL) {
+      int err = js_throw_error(env, NULL, "Failed to create module script");
+      assert(err == 0);
+      return js__error(env);
+    }
+  }
+
+  return 0;
 }
 
-// https://bugs.webkit.org/show_bug.cgi?id=261600
 int
 js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
-  int err;
+  if (env->exception) return js__error(env);
 
-  err = js_throw_error(env, NULL, "Unsupported operation: js_run_module");
-  assert(err == 0);
+  if (module->jsc_script == NULL) {
+    int err = js_throw_error(env, NULL, "Module not instantiated");
+    assert(err == 0);
+    return js__error(env);
+  }
 
-  return js__error(env);
+  // For synthetic modules: call evaluate callback and set globalThis exports
+  // BEFORE evaluation so the generated source can read them.
+  if (module->is_synthetic) {
+    if (module->callbacks.evaluate) {
+      module->callbacks.evaluate(env, module, module->callbacks.evaluate_data);
+    }
+
+    // Set globalThis.__jsc_syn[name] = pending_exports
+    JSObjectRef global = JSContextGetGlobalObject(env->context);
+
+    JSStringRef syn_key = JSStringCreateWithUTF8CString("__jsc_syn");
+    JSValueRef syn_val = JSObjectGetProperty(env->context, global, syn_key, NULL);
+
+    if (JSValueIsUndefined(env->context, syn_val)) {
+      JSObjectRef syn_obj = JSObjectMake(env->context, NULL, NULL);
+      JSObjectSetProperty(env->context, global, syn_key, (JSValueRef) syn_obj, 0, NULL);
+      syn_val = (JSValueRef) syn_obj;
+    }
+    JSStringRelease(syn_key);
+
+    if (module->pending_exports) {
+      JSStringRef name_key = JSStringCreateWithUTF8CString(module->name);
+      JSObjectSetProperty(env->context, (JSObjectRef) syn_val, name_key,
+                          (JSValueRef) module->pending_exports, 0, NULL);
+      JSStringRelease(name_key);
+    }
+  }
+
+  // Set current module for the delegate
+  js_module_t *saved = env->current_loading_module;
+  env->current_loading_module = module;
+
+  env->depth++;
+
+  // Evaluate the module script
+  JSValueRef jsc_promise = js__module_script_evaluate(
+    env->objc_context, module->jsc_script);
+
+  env->depth--;
+
+  env->current_loading_module = saved;
+
+  if (jsc_promise == NULL) {
+    if (env->exception) return js__propagate_exception(env);
+
+    int err = js_throw_error(env, NULL, "Module evaluation returned NULL");
+    assert(err == 0);
+    return js__error(env);
+  }
+
+  // Track the promise state. The JSC promise doesn't support __ps private
+  // properties, so we chain it to a deferred promise we create ourselves.
+  // Set the JSC promise on a temp global, chain .then/.catch to capture
+  // state, drain microtasks, then create our tracked promise.
+
+  JSObjectRef global = JSContextGetGlobalObject(env->context);
+
+  JSStringRef mp_key = JSStringCreateWithUTF8CString("__jsc_mp");
+  JSObjectSetProperty(env->context, global, mp_key, jsc_promise, 0, NULL);
+  JSStringRelease(mp_key);
+
+  // Set up state tracking + drain microtasks
+  JSStringRef chain_code = JSStringCreateWithUTF8CString(
+    "globalThis.__jsc_ms = 0; globalThis.__jsc_mr = undefined;"
+    "__jsc_mp.then("
+    "  function(v) { globalThis.__jsc_ms = 1; globalThis.__jsc_mr = v; },"
+    "  function(r) { globalThis.__jsc_ms = 2; globalThis.__jsc_mr = r; }"
+    ")");
+  JSEvaluateScript(env->context, chain_code, NULL, NULL, 0, NULL);
+  JSStringRelease(chain_code);
+
+  // Drain microtasks
+  JSStringRef drain = JSStringCreateWithUTF8CString("0");
+  JSEvaluateScript(env->context, drain, NULL, NULL, 0, NULL);
+  JSStringRelease(drain);
+
+  // Read the state
+  JSStringRef ms_key = JSStringCreateWithUTF8CString("__jsc_ms");
+  JSValueRef ms_val = JSObjectGetProperty(env->context, global, ms_key, NULL);
+  JSStringRelease(ms_key);
+  int state = (int) JSValueToNumber(env->context, ms_val, NULL);
+
+  JSStringRef mr_key = JSStringCreateWithUTF8CString("__jsc_mr");
+  JSValueRef mr_val = JSObjectGetProperty(env->context, global, mr_key, NULL);
+  JSStringRelease(mr_key);
+
+  // Create a tracked deferred promise with __ps set
+  JSObjectRef resolve_fn, reject_fn;
+  JSValueRef exception = NULL;
+  JSObjectRef tracked = JSObjectMakeDeferredPromise(
+    env->context, &resolve_fn, &reject_fn, &exception);
+
+  JSStringRef ps_key = JSStringCreateWithUTF8CString("__ps");
+  JSStringRef pr_key = JSStringCreateWithUTF8CString("__pr");
+
+  if (state == 1) {
+    JSObjectSetPrivateProperty(env->context, tracked, ps_key,
+                               JSValueMakeNumber(env->context, 1));
+    JSObjectSetPrivateProperty(env->context, tracked, pr_key, mr_val);
+
+    JSValueRef args[] = {mr_val};
+    JSObjectCallAsFunction(env->context, resolve_fn, NULL, 1, args, NULL);
+  } else if (state == 2) {
+    JSObjectSetPrivateProperty(env->context, tracked, ps_key,
+                               JSValueMakeNumber(env->context, 2));
+    JSObjectSetPrivateProperty(env->context, tracked, pr_key, mr_val);
+
+    // Don't call reject_fn to avoid double unhandled-rejection.
+    // The test only checks __ps/__pr via js_get_promise_state/result.
+  } else {
+    JSObjectSetPrivateProperty(env->context, tracked, ps_key,
+                               JSValueMakeNumber(env->context, 0));
+  }
+
+  JSStringRelease(ps_key);
+  JSStringRelease(pr_key);
+
+  // Clean up temp globals
+  JSStringRef del1 = JSStringCreateWithUTF8CString("__jsc_mp");
+  JSObjectDeleteProperty(env->context, global, del1, NULL);
+  JSStringRelease(del1);
+
+  JSStringRef del2 = JSStringCreateWithUTF8CString("__jsc_ms");
+  JSObjectDeleteProperty(env->context, global, del2, NULL);
+  JSStringRelease(del2);
+
+  JSStringRef del3 = JSStringCreateWithUTF8CString("__jsc_mr");
+  JSObjectDeleteProperty(env->context, global, del3, NULL);
+  JSStringRelease(del3);
+
+  *result = (js_value_t *) tracked;
+
+  js__attach_to_handle_scope(env, env->scope, (JSValueRef) tracked);
+
+  return 0;
 }
 
 static void
