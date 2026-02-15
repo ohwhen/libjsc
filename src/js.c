@@ -108,6 +108,12 @@ struct js_env_s {
   void *module_loader_delegate; // Retained JSCModuleDelegate*
   js_module_t *current_loading_module;
 
+  // Module evaluation order (DFS post-order: leaves first, root last).
+  // Populated during js_instantiate_module, consumed during js_run_module.
+  js_module_t **module_eval_order;
+  size_t module_eval_count;
+  size_t module_eval_capacity;
+
   JSContextGroupRef group;
   JSGlobalContextRef context;
   JSValueRef exception;
@@ -930,6 +936,10 @@ js__close_env(js_env_t *env) {
   JSClassRelease(env->classes.external);
   JSClassRelease(env->classes.constructor);
 
+  free(env->module_eval_order);
+  env->module_eval_order = NULL;
+  env->module_eval_count = 0;
+
   js__module_delegate_release(env->module_loader_delegate);
   js__objc_context_release(env->objc_context);
 
@@ -967,6 +977,10 @@ js_create_env(uv_loop_t *loop, js_platform_t *platform, const js_env_options_t *
   env->objc_context = objc_context;
   env->module_loader_delegate = js__module_delegate_create(env);
   env->current_loading_module = NULL;
+
+  env->module_eval_order = NULL;
+  env->module_eval_count = 0;
+  env->module_eval_capacity = 0;
 
   js__module_delegate_set(objc_context, env->module_loader_delegate);
 
@@ -1504,6 +1518,15 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
         env->objc_context, module->source, base_url);
     }
     js__module_delegate_register(env->module_loader_delegate, base_url, module);
+
+    // Track in eval order
+    if (env->module_eval_count >= env->module_eval_capacity) {
+      env->module_eval_capacity = env->module_eval_capacity ? env->module_eval_capacity * 2 : 64;
+      env->module_eval_order = realloc(env->module_eval_order,
+        env->module_eval_capacity * sizeof(js_module_t *));
+    }
+    env->module_eval_order[env->module_eval_count++] = module;
+
     return 0;
   }
 
@@ -1629,6 +1652,16 @@ js__instantiate_module_at_url(js_env_t *env, js_module_t *module,
   // Register in delegate's registry
   js__module_delegate_register(env->module_loader_delegate, base_url, module);
 
+  // Track in DFS post-order for topological pre-evaluation.
+  // Children were already added by recursive calls above, so this module
+  // appears after all its dependencies — enabling bottom-up evaluation.
+  if (env->module_eval_count >= env->module_eval_capacity) {
+    env->module_eval_capacity = env->module_eval_capacity ? env->module_eval_capacity * 2 : 64;
+    env->module_eval_order = realloc(env->module_eval_order,
+      env->module_eval_capacity * sizeof(js_module_t *));
+  }
+  env->module_eval_order[env->module_eval_count++] = module;
+
   js__free_import_specifiers(specifiers, spec_count);
   for (size_t b = 0; b < bare_count; b++) free((void *)bare_urls[b]);
   free(bare_specs);
@@ -1663,11 +1696,87 @@ js_run_module(js_env_t *env, js_module_t *module, js_value_t **result) {
   // the delegate handles setting globalThis.__jsc_syn before JSC
   // evaluates the synthetic source.
 
+  // --- Topological pre-evaluation ---
+  // Evaluate all dependency modules in bottom-up order (leaves first) before
+  // evaluating the root module. This populates JSC's internal module cache
+  // so that when the root module is evaluated, all its imports are found in
+  // the cache and the delegate is NOT called — eliminating the deep recursion
+  // that causes RangeError: Maximum call stack size exceeded on iOS.
+  if (env->module_eval_count > 0) {
+    char logbuf[128];
+    snprintf(logbuf, sizeof(logbuf),
+      "js_run_module: pre-evaluating %zu dependency modules", env->module_eval_count);
+    js__nslog(logbuf);
+
+    for (size_t i = 0; i < env->module_eval_count; i++) {
+      js_module_t *dep = env->module_eval_order[i];
+      if (dep == module) continue;  // Skip the root — evaluated below
+      if (dep->jsc_script == NULL) continue;
+
+      JSValueRef dep_result = js__module_script_evaluate(
+        env->objc_context, dep->jsc_script);
+
+      if (dep_result != NULL && JSValueIsObject(env->context, dep_result)) {
+        // Check if this returned a promise (module has dependencies still resolving)
+        JSStringRef then_key = JSStringCreateWithUTF8CString("then");
+        JSValueRef then_val = JSObjectGetProperty(env->context,
+          (JSObjectRef)dep_result, then_key, NULL);
+        JSStringRelease(then_key);
+
+        if (!JSValueIsUndefined(env->context, then_val)) {
+          // Dependency returned a promise — drain until it resolves.
+          // This shouldn't happen for leaf modules (no imports).
+          snprintf(logbuf, sizeof(logbuf),
+            "js_run_module: dep[%zu] '%s' returned promise, draining",
+            i, dep->name ? dep->name : "?");
+          js__nslog(logbuf);
+
+          // Set up promise tracking
+          JSObjectRef global = JSContextGetGlobalObject(env->context);
+          JSStringRef dp_key = JSStringCreateWithUTF8CString("__jsc_dp");
+          JSObjectSetProperty(env->context, global, dp_key, dep_result, 0, NULL);
+          JSStringRelease(dp_key);
+
+          JSStringRef track_code = JSStringCreateWithUTF8CString(
+            "globalThis.__jsc_ds = 0;"
+            "__jsc_dp.then("
+            "  function() { globalThis.__jsc_ds = 1; },"
+            "  function() { globalThis.__jsc_ds = 2; }"
+            ")");
+          JSEvaluateScript(env->context, track_code, NULL, NULL, 0, NULL);
+          JSStringRelease(track_code);
+
+          int dep_state = 0;
+          for (int iter = 0; iter < 1000 && dep_state == 0; iter++) {
+            js__module_delegate_drain_one(env->module_loader_delegate);
+            js__drain_run_loop();
+            dep_state = js__objc_eval_int(env->objc_context, "globalThis.__jsc_ds");
+          }
+
+          // Clean up tracking globals
+          JSStringRef del_dp = JSStringCreateWithUTF8CString("__jsc_dp");
+          JSObjectDeleteProperty(env->context, global, del_dp, NULL);
+          JSStringRelease(del_dp);
+          JSStringRef del_ds = JSStringCreateWithUTF8CString("__jsc_ds");
+          JSObjectDeleteProperty(env->context, global, del_ds, NULL);
+          JSStringRelease(del_ds);
+
+          snprintf(logbuf, sizeof(logbuf),
+            "js_run_module: dep[%zu] drain finished, state=%d", i, dep_state);
+          js__nslog(logbuf);
+        }
+      }
+    }
+
+    // Clear the eval order — consumed
+    env->module_eval_count = 0;
+
+    js__nslog("js_run_module: pre-evaluation complete, evaluating root module");
+  }
+
   env->depth++;
 
-  // Evaluate the module via the Obj-C API (evaluateJSScript:).
-  // This triggers the delegate synchronously for module dependencies,
-  // unlike JavaScript's import() which is always async.
+  // Evaluate the root module. All imports should be in JSC's cache now.
   JSValueRef eval_result = js__module_script_evaluate(
     env->objc_context, module->jsc_script);
 
