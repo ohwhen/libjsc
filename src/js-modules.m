@@ -353,7 +353,23 @@ void *
 js__module_script_create(void *objc_context, const char *source, const char *url) {
   JSContext *ctx = (__bridge JSContext *)objc_context;
 
-  NSString *srcStr = [NSString stringWithUTF8String:source];
+  // Strip `with { ... }` import attributes from ESM source before JSC compilation.
+  // JSC only supports the standard `type` attribute — custom attributes like `imports`
+  // (used by bare-module for Node.js builtin resolution) cause a parse error.
+  // bare-module resolves these at its own level so JSC doesn't need them.
+  NSString *raw = [NSString stringWithUTF8String:source];
+  static NSRegularExpression *re = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    re = [NSRegularExpression
+      regularExpressionWithPattern:@"\\bwith\\s*\\{[^}]*\\}"
+      options:0
+      error:nil];
+  });
+  NSString *srcStr = [re stringByReplacingMatchesInString:raw
+    options:0
+    range:NSMakeRange(0, raw.length)
+    withTemplate:@""];
   NSURL *srcURL = [NSURL URLWithString:[NSString stringWithUTF8String:url]];
 
   NSError *error = nil;
